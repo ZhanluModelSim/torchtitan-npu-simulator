@@ -24,8 +24,8 @@ def test_attention_forward_backward_expose_roles_and_distinct_sequence_axes():
         output.backward(torch.empty_like(output))
 
     nodes = {node.annotations["raw_op_type"]: node for node in capture.build_nodes().values()}
-    forward = nodes["kimi_sim.fusion_attention.default"]
-    backward = nodes["kimi_sim.fusion_attention_grad.default"]
+    forward = nodes["fused.fusion_attention.default"]
+    backward = nodes["fused.fusion_attention_grad.default"]
     expected_inputs = (
         {"index": 0, "role": "query", "axes": ("batch", "head", "q_len", "qk_head_dim")},
         {"index": 1, "role": "key", "axes": ("batch", "head", "kv_len", "qk_head_dim")},
@@ -68,8 +68,8 @@ def test_kda_backward_retains_parameter_axes_and_flattened_bias_axis():
         output.backward(torch.empty_like(output))
 
     nodes = {node.annotations["raw_op_type"]: node for node in capture.build_nodes().values()}
-    forward = nodes["kimi_sim.chunk_kda.default"].attrs["tensor_semantics"]
-    backward = nodes["kimi_sim.chunk_kda_grad.default"].attrs["tensor_semantics"]
+    forward = nodes["fused.chunk_kda.default"].attrs["tensor_semantics"]
+    backward = nodes["fused.chunk_kda_grad.default"].attrs["tensor_semantics"]
     assert [(item["role"], item["axes"]) for item in forward["inputs"]] == [
         ("query", ("batch", "sequence", "head", "key_head_dim")),
         ("key", ("batch", "sequence", "head", "key_head_dim")),
@@ -108,8 +108,8 @@ def test_situ_keeps_leading_axes_unknown_for_dense_and_routed_inputs(shape):
         output.backward(torch.empty_like(output))
 
     nodes = {node.annotations["raw_op_type"]: node for node in capture.build_nodes().values()}
-    forward = nodes["kimi_sim.situ_glu.default"].attrs["tensor_semantics"]
-    backward = nodes["kimi_sim.situ_glu_backward.default"].attrs["tensor_semantics"]
+    forward = nodes["fused.situ_glu.default"].attrs["tensor_semantics"]
+    backward = nodes["fused.situ_glu_backward.default"].attrs["tensor_semantics"]
     assert [item["role"] for item in forward["inputs"]] == ["gate", "up"]
     assert [item["role"] for item in backward["outputs"]] == ["gate_gradient", "up_gradient"]
     for semantics in (forward, backward):
@@ -122,7 +122,7 @@ def test_roles_follow_keyword_occurrences_even_when_the_same_tensor_is_reused():
     capture = OpDispatchCapture(record_memory=False)
 
     capture.__torch_dispatch__(
-        torch.ops.kimi_sim.fusion_attention.default, (), (), {"v": tensor, "q": tensor, "k": tensor, "scale": 0.5}
+        torch.ops.fused.fusion_attention.default, (), (), {"v": tensor, "q": tensor, "k": tensor, "scale": 0.5}
     )
 
     (node,) = capture.build_nodes().values()

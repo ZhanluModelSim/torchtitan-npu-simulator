@@ -47,7 +47,7 @@ _GDN2_MASK = ("mask", TensorMeaning("padding_mask", _MASK_AXES, optional=True))
 _GDN2_OUTPUT = TensorMeaning("attention_output", _V_AXES)
 
 
-@torch.library.custom_op("system3_sim::swiglu_clamp", mutates_args=())
+@torch.library.custom_op("fused::swiglu_clamp", mutates_args=())
 def swiglu_clamp(x: torch.Tensor, gate: torch.Tensor, clamp_val: float | None) -> torch.Tensor:
     raise RuntimeError("system3 virtual swiglu_clamp is available only for Meta simulation")
 
@@ -57,7 +57,7 @@ def _swiglu_clamp_meta(x, gate, clamp_val):
     return torch.empty_like(x)
 
 
-@torch.library.custom_op("system3_sim::swiglu_clamp_backward", mutates_args=())
+@torch.library.custom_op("fused::swiglu_clamp_backward", mutates_args=())
 def swiglu_clamp_backward(
     x: torch.Tensor, gate: torch.Tensor, dy: torch.Tensor, clamp_val: float | None
 ) -> list[torch.Tensor]:
@@ -81,7 +81,7 @@ def _swiglu_backward(ctx, dy):
 swiglu_clamp.register_autograd(_swiglu_backward, setup_context=_swiglu_setup)
 
 
-@torch.library.custom_op("system3_sim::gdn2_chunked", mutates_args=())
+@torch.library.custom_op("fused::gdn2_chunked", mutates_args=())
 def gdn2_chunked(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -100,7 +100,7 @@ def _gdn2_chunked_meta(q, k, v, alpha, beta_erase, beta_write, da_gain, mask):
     return torch.empty_like(v)
 
 
-@torch.library.custom_op("system3_sim::gdn2_chunked_backward", mutates_args=())
+@torch.library.custom_op("fused::gdn2_chunked_backward", mutates_args=())
 def gdn2_chunked_backward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -209,7 +209,7 @@ def _isa_indexer_geometry(idx_q, idx_k_c):
     return b, s, width, idx_k_c.shape[1]
 
 
-@torch.library.custom_op("system3_sim::isa_indexer", mutates_args=())
+@torch.library.custom_op("fused::isa_indexer", mutates_args=())
 def isa_indexer(
     idx_q: torch.Tensor,
     idx_k_c: torch.Tensor,
@@ -235,7 +235,7 @@ def _isa_indexer_meta(idx_q, idx_k_c, mask, topk, compress_ratio):
     return indices, scores
 
 
-@torch.library.custom_op("system3_sim::isa_indexer_grad", mutates_args=())
+@torch.library.custom_op("fused::isa_indexer_grad", mutates_args=())
 def isa_indexer_grad(
     idx_q: torch.Tensor,
     idx_k_c: torch.Tensor,
@@ -294,7 +294,7 @@ def _isa_attention_geometry(q, k, v, indices, bias):
     return b, s, heads, width, k.shape[1]
 
 
-@torch.library.custom_op("system3_sim::isa_sparse_attention", mutates_args=())
+@torch.library.custom_op("fused::isa_sparse_attention", mutates_args=())
 def isa_sparse_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -328,7 +328,7 @@ def _isa_sparse_attention_meta(q, k, v, indices, bias, mask, scale, clamp_val, c
     return out, lse
 
 
-@torch.library.custom_op("system3_sim::isa_sparse_attention_grad", mutates_args=())
+@torch.library.custom_op("fused::isa_sparse_attention_grad", mutates_args=())
 def isa_sparse_attention_grad(
     q: torch.Tensor,
     k: torch.Tensor,

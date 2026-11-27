@@ -71,13 +71,13 @@ def test_deepseek_v4_1_capture_reaches_iteration_with_metadata_map(world, replic
         for node in template.nodes.values()
         if "tensor_semantics" in node.attrs
     }
-    assert custom == {"torchtitan_npu.npu_moe_token_unpermute.default", "dsv41_sim.sparse_adam_update.default"}
+    assert custom == {"torchtitan_npu.npu_moe_token_unpermute.default", "fused.sparse_adam_update.default"}
 
     nodes = [n for template in workload.step_templates.values() for n in template.nodes.values()]
     unpermute = "torchtitan_npu.npu_moe_token_unpermute.default"
     unpermutes = sum(1 for n in nodes if n.annotations["raw_op_type"] == unpermute)
     assert unpermutes == (80 if ac == "full" else 40)
-    sparse_update = "dsv41_sim.sparse_adam_update.default"
+    sparse_update = "fused.sparse_adam_update.default"
     assert sum(1 for n in nodes if n.annotations["raw_op_type"] == sparse_update) == 2
 
     # The sparse boundary keeps explicit cross-boundary dependencies (PR #19

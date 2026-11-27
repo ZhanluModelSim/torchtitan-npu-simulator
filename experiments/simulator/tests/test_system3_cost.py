@@ -96,7 +96,7 @@ def test_system3_residual_unknowns_are_control_or_view_nodes(_annotated_nodes) -
         # Declared host-side SparseAdam boundary (PR #24 review): the update
         # math is host work behind the dense gradient exemption; its cost
         # modeling belongs to the operator-performance-models package.
-        "system3_sim.sparse_adam_update.default",
+        "fused.sparse_adam_update.default",
         # Multimodal encoder FA backward: the capture now carries the native
         # BSND softmax stats (B, H, S, 8) float32 (PR #24 review), while the
         # operator-performance-models family contract still pins the legacy

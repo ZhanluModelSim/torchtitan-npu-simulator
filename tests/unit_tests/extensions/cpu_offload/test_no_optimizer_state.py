@@ -326,3 +326,9 @@ def test_muon_checkpoint_roundtrip_steps_on_compute_device() -> None:
     restored_optimizer._staging.wait()
     momentum = restored_optimizer.state[restored_parameter]["momentum_buffer"]
     assert momentum.to_local().device.type == "npu"
+
+    # Leave no initialized WORLD behind: later tests (e.g. the auto-overlap
+    # scheduler) branch on ``dist.is_initialized()`` and a leaked group would
+    # flip them into their initialized-code paths without a matching runtime.
+    if dist.is_initialized():
+        dist.destroy_process_group()

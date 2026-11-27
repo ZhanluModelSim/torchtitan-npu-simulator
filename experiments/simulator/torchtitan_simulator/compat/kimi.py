@@ -19,7 +19,7 @@ from torchtitan_simulator.capture.tensor_semantics import (
 )
 
 
-@torch.library.custom_op("kimi_sim::chunk_kda", mutates_args=())
+@torch.library.custom_op("fused::chunk_kda", mutates_args=())
 def chunk_kda(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -38,7 +38,7 @@ def _kda_meta(q, k, v, g, beta, A_log, dt_bias, lower_bound):
     return torch.empty_like(v)
 
 
-@torch.library.custom_op("kimi_sim::chunk_kda_grad", mutates_args=())
+@torch.library.custom_op("fused::chunk_kda_grad", mutates_args=())
 def chunk_kda_grad(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -70,7 +70,7 @@ def _kda_backward(ctx, dy):
 chunk_kda.register_autograd(_kda_backward, setup_context=_kda_setup)
 
 
-@torch.library.custom_op("kimi_sim::fusion_attention", mutates_args=())
+@torch.library.custom_op("fused::fusion_attention", mutates_args=())
 def fusion_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float) -> torch.Tensor:
     raise RuntimeError("Kimi virtual attention is available only for Meta simulation")
 
@@ -80,7 +80,7 @@ def _attention_meta(q, k, v, scale):
     return torch.empty_like(q)
 
 
-@torch.library.custom_op("kimi_sim::fusion_attention_grad", mutates_args=())
+@torch.library.custom_op("fused::fusion_attention_grad", mutates_args=())
 def fusion_attention_grad(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, dy: torch.Tensor, scale: float
 ) -> list[torch.Tensor]:
@@ -104,7 +104,7 @@ def _attention_backward(ctx, dy):
 fusion_attention.register_autograd(_attention_backward, setup_context=_attention_setup)
 
 
-@torch.library.custom_op("kimi_sim::situ_glu", mutates_args=())
+@torch.library.custom_op("fused::situ_glu", mutates_args=())
 def situ_glu(gate: torch.Tensor, up: torch.Tensor, beta: float, linear_beta: float | None) -> torch.Tensor:
     raise RuntimeError("Kimi virtual SiTU is available only for Meta simulation")
 
@@ -114,7 +114,7 @@ def _situ_meta(gate, up, beta, linear_beta):
     return torch.empty_like(gate)
 
 
-@torch.library.custom_op("kimi_sim::situ_glu_backward", mutates_args=())
+@torch.library.custom_op("fused::situ_glu_backward", mutates_args=())
 def situ_glu_backward(
     gate: torch.Tensor, up: torch.Tensor, dy: torch.Tensor, beta: float, linear_beta: float | None
 ) -> list[torch.Tensor]:

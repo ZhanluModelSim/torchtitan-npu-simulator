@@ -19,6 +19,7 @@ F/B/O includes the sparse work the dense gradient contract exempts.
 """
 
 import torch
+from torch.distributed._functional_collectives import all_reduce
 from torch.profiler import record_function
 
 from torchtitan_simulator.capture.dispatch_capture import (
@@ -33,7 +34,7 @@ from torchtitan_simulator.capture.tensor_semantics import (
 )
 
 
-@torch.library.custom_op("dsv41_sim::sparse_adam_update", mutates_args=("parameter", "exp_avg", "exp_avg_sq"))
+@torch.library.custom_op("fused::sparse_adam_update", mutates_args=("parameter", "exp_avg", "exp_avg_sq"))
 def sparse_adam_update(
     parameter: torch.Tensor,
     grad_indices: torch.Tensor,
@@ -63,7 +64,7 @@ def _sparse_adam_update_meta(parameter, grad_indices, grad_values, exp_avg, exp_
 
 
 register_tensor_semantics(
-    "dsv41_sim.sparse_adam_update.default",
+    "fused.sparse_adam_update.default",
     OperatorTensorSemantics(
         inputs=(
             ("parameter", TensorMeaning("host_table_weight", ("table_row", "embedding_dim"))),
@@ -263,13 +264,12 @@ def _meta_clip_grad_norm_with_host_sparse_tables(
     group_squares: dict = {}
     for table in pending_tables:
         lookup_mesh = table.lookup_mesh
-        if lookup_mesh is not None and lookup_mesh.size() > 1:
-            # Single-process capture owns one logical rank: summing row
-            # squares across an EP group needs the multi-rank collective,
-            # which is outside the single-process capture contract.
-            raise RuntimeError("Host Engram row-squared reduction is outside the single-process capture contract")
         # Rows are owner-local at EP degree 1: the production all_reduce over
-        # the trivial row-ownership group is the identity.
+        # the trivial row-ownership group is the identity. At EP degree > 1
+        # the mesh-based functional collective models the production group
+        # reduction shape-visibly (single-process capture owns one logical
+        # rank; the swap is declared, not executed) -- the same convention the
+        # system3 host-Engram capture face uses.
         group = lookup_mesh.get_group() if lookup_mesh is not None else None
         if group not in group_squares:
             group_squares[group] = torch.zeros((), dtype=torch.float32)
@@ -284,9 +284,12 @@ def _meta_clip_grad_norm_with_host_sparse_tables(
         group_squares[group] = group_squares[group] + squares
     sparse_sq = torch.zeros((), dtype=torch.float32, device=dense_norm.device)
     for group, local_sq in group_squares.items():
-        # The row-ownership group was verified trivial above; the production
-        # all_reduce is the identity, and the host scalar joins the device
-        # coefficient math like production's transfer to the dense device.
+        # Production all-reduces the row squares over the row-ownership group
+        # and then moves the host scalar next to the dense norm. The capture
+        # face models the group reduction with the same mesh-based functional
+        # collective the routed path uses, and the trivial group skips it.
+        if group is not None and local_sq.device.type == "meta":
+            local_sq = all_reduce(local_sq, "sum", group=group)
         sparse_sq = sparse_sq + local_sq.to(dense_norm.device)
     dense_norm_f32 = dense_norm.detach().float()
     total_norm = torch.sqrt(dense_norm_f32.pow(2) + sparse_sq)

@@ -884,10 +884,29 @@ def test_npu_reorder_retains_window_and_effect_boundaries(rms_reorder_window, co
     assert schedule.order.index(norm) < schedule.order.index(v0)
 
 
+def _torchao_li_metadata_available() -> bool:
+    """Whether the installed torchao-npu ships the V4 LI metadata provider.
+
+    The quantized (fp8 LI) chunk-metadata case builds the quantized provider
+    from ``torchao_npu.quantized_modules.deepseek_v4.lightning_indexer_metadata``;
+    torchao-npu builds without that module cannot cover it.
+    """
+    try:
+        import torchao_npu.quantized_modules.deepseek_v4.lightning_indexer_metadata  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
 @pytest.mark.parametrize(
     "shared_qk,chunk_only_metadata,quantized",
     [(False, False, False), (True, True, False), (True, False, True)],
     ids=["separate_qk", "shared_qk_extra_roles", "fp8_li"],
+)
+@pytest.mark.skipif(
+    not _torchao_li_metadata_available(),
+    reason="torchao-npu build ships no V4 LI metadata provider (fp8 LI case)",
 )
 def test_chunk_config_prebuilds_metadata_with_full_qk_contract(
     dsv4, shared_qk, chunk_only_metadata, quantized, monkeypatch

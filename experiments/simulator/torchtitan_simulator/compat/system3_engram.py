@@ -21,7 +21,7 @@ The host sparse-gradient side effects are bridged explicitly for Meta
 (PR #19 review protocol): the pending sparse gradient accumulates on meta
 tensors, the host clipping rescale keeps its op structure, and the
 per-table SparseAdam update records through the declared
-``system3_sim.sparse_adam_update`` boundary so the captured F/B/O includes
+``fused.sparse_adam_update`` boundary so the captured F/B/O includes
 the sparse work the dense gradient contract exempts. Real-device execution
 is untouched.
 """
@@ -42,52 +42,10 @@ from torchtitan_simulator.capture.tensor_semantics import (
 )
 
 
-@torch.library.custom_op("system3_sim::sparse_adam_update", mutates_args=("parameter", "exp_avg", "exp_avg_sq"))
-def sparse_adam_update(
-    parameter: torch.Tensor,
-    grad_indices: torch.Tensor,
-    grad_values: torch.Tensor,
-    exp_avg: torch.Tensor,
-    exp_avg_sq: torch.Tensor,
-    step: int,
-    lr: float,
-    beta1: float,
-    beta2: float,
-    eps: float,
-) -> None:
-    """Virtual boundary of one native SparseAdam table update.
-
-    The native functional coalesces the sparse gradient and masks the moments
-    through SparseMeta kernels that do not exist, so the simulator records the
-    update at this declared boundary instead: the same parameter selection,
-    state materialization and per-table work as production, executed only in
-    Meta capture. The sparse gradient enters as its dense index/value rows.
-    """
-    raise RuntimeError("system3 virtual SparseAdam update is available only for Meta simulation")
-
-
-@sparse_adam_update.register_fake
-def _sparse_adam_update_meta(parameter, grad_indices, grad_values, exp_avg, exp_avg_sq, step, lr, beta1, beta2, eps):
-    return None
-
-
-register_tensor_semantics(
-    "system3_sim.sparse_adam_update.default",
-    OperatorTensorSemantics(
-        inputs=(
-            ("parameter", TensorMeaning("host_table_weight", ("table_row", "embedding_dim"))),
-            ("grad_indices", TensorMeaning("host_sparse_gradient_row_ids", ("sparse_dim", "sparse_entry"))),
-            ("grad_values", TensorMeaning("host_sparse_gradient_values", ("sparse_entry", "embedding_dim"))),
-            ("exp_avg", TensorMeaning("first_moment", ("table_row", "embedding_dim"))),
-            ("exp_avg_sq", TensorMeaning("second_moment", ("table_row", "embedding_dim"))),
-        ),
-        outputs=(
-            TensorMeaning("host_table_weight", ("table_row", "embedding_dim")),
-            TensorMeaning("first_moment", ("table_row", "embedding_dim")),
-            TensorMeaning("second_moment", ("table_row", "embedding_dim")),
-        ),
-    ),
-)
+# The fused SparseAdam boundary (registration, fake and tensor semantics) is
+# declared once in compat.deepseek_v4_1 and reused here so every model shares
+# one capture name.
+from torchtitan_simulator.compat.deepseek_v4_1 import sparse_adam_update  # noqa: E402
 
 
 def _meta_accumulate_sparse_gradient(self, local_row_ids: torch.Tensor, grad_rows: torch.Tensor) -> None:
@@ -571,7 +529,7 @@ def install_system3_engram_meta_support(scope):
     return (
         "host-table lookup keeps the formal autograd boundary with visible transfers (EP=1) / "
         "balanced functional a2a (EP>1); pending sparse gradient, host clip and SparseAdam "
-        "updates record through the system3_sim.sparse_adam_update boundary"
+        "updates record through the fused.sparse_adam_update boundary"
     )
 
 

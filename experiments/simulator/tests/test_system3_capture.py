@@ -70,22 +70,22 @@ def test_system3_text_capture_reaches_iteration_with_reference_operators():
     counts = Counter(n.annotations["raw_op_type"] for n in nodes)
     # The compatibility layer installs the system3 virtual fusions and the
     # npu_rms_norm recipe: the per-token delta-rule loop collapses into
-    # ``system3_sim.gdn2_chunked`` (absorbing the eager pad/mask branches),
-    # the MoE FFN activation collapses into ``system3_sim.swiglu_clamp``
+    # ``fused.gdn2_chunked`` (absorbing the eager pad/mask branches),
+    # the MoE FFN activation collapses into ``fused.swiglu_clamp``
     # (absorbing silu/gelu), the ISA top-K selection and the selected-key
-    # attention core collapse into ``system3_sim.isa_indexer`` /
+    # attention core collapse into ``fused.isa_indexer`` /
     # ``isa_sparse_attention`` (absorbing the indexer topk/softmax and the
     # gather/score/combine einsums), and the reference RMSNorm math
     # dispatches as ``npu_rms_norm``.  The remaining eager operators (MoE
     # routing topk, grouped GEMMs, router softmax) keep their counts.
-    assert counts["system3_sim.gdn2_chunked.default"] == 18
-    assert counts["system3_sim.gdn2_chunked_backward.default"] == 18
-    assert counts["system3_sim.swiglu_clamp.default"] == 36
-    assert counts["system3_sim.swiglu_clamp_backward.default"] == 36
-    assert counts["system3_sim.isa_indexer.default"] == 4
-    assert counts["system3_sim.isa_indexer_grad.default"] == 4
-    assert counts["system3_sim.isa_sparse_attention.default"] == 6
-    assert counts["system3_sim.isa_sparse_attention_grad.default"] == 6
+    assert counts["fused.gdn2_chunked.default"] == 18
+    assert counts["fused.gdn2_chunked_backward.default"] == 18
+    assert counts["fused.swiglu_clamp.default"] == 36
+    assert counts["fused.swiglu_clamp_backward.default"] == 36
+    assert counts["fused.isa_indexer.default"] == 4
+    assert counts["fused.isa_indexer_grad.default"] == 4
+    assert counts["fused.isa_sparse_attention.default"] == 6
+    assert counts["fused.isa_sparse_attention_grad.default"] == 6
     assert counts["npu.npu_rms_norm.default"] == 243
     assert counts["npu.npu_rms_norm_backward.default"] == 243
     assert counts["aten.constant_pad_nd.default"] == 0
@@ -103,20 +103,20 @@ def test_system3_text_capture_reaches_iteration_with_reference_operators():
     assert counts["aten.empty.memory_format"] == 6
     assert len(_table_host_transfers(nodes)) == 6
     # No foreign virtual fusions: the only virtual ops are this workspace's
-    # system3_sim family, and they are the only nodes carrying
+    # fused family, and they are the only nodes carrying
     # ``tensor_semantics`` schema attributes.
-    assert not any(raw.startswith(("multi_head_moe_sim.", "deepseek_v4.")) for raw in counts)
+    assert not any(raw.startswith("deepseek_v4.") for raw in counts)
     semantic_nodes = [n for n in nodes if "tensor_semantics" in n.attrs]
     assert {n.annotations["raw_op_type"] for n in semantic_nodes} == {
-        "system3_sim.gdn2_chunked.default",
-        "system3_sim.gdn2_chunked_backward.default",
-        "system3_sim.swiglu_clamp.default",
-        "system3_sim.swiglu_clamp_backward.default",
-        "system3_sim.isa_indexer.default",
-        "system3_sim.isa_indexer_grad.default",
-        "system3_sim.isa_sparse_attention.default",
-        "system3_sim.isa_sparse_attention_grad.default",
-        "system3_sim.sparse_adam_update.default",
+        "fused.gdn2_chunked.default",
+        "fused.gdn2_chunked_backward.default",
+        "fused.swiglu_clamp.default",
+        "fused.swiglu_clamp_backward.default",
+        "fused.isa_indexer.default",
+        "fused.isa_indexer_grad.default",
+        "fused.isa_sparse_attention.default",
+        "fused.isa_sparse_attention_grad.default",
+        "fused.sparse_adam_update.default",
     }
     gradients = workload.iteration.schedule.annotations["gradient_validation"]
     # Only the dense parameters carry the gradient contract; the three host
@@ -138,7 +138,7 @@ def test_system3_text_capture_reaches_iteration_with_reference_operators():
     # The sparse update actually executes: one declared SparseAdam update per
     # table, with captured state materialization and pending-gradient
     # consumption behind the dense gradient exemption (PR #24 review).
-    assert counts["system3_sim.sparse_adam_update.default"] == 3
+    assert counts["fused.sparse_adam_update.default"] == 3
     layouts = workload.iteration.schedule.annotations["parameter_layouts"]
     evidence = workload.iteration.schedule.annotations["sparse_optimizer_validation"]
     assert set(evidence) == {name for name in layouts if "hash_tables" in name}
@@ -158,14 +158,14 @@ def test_system3_full_ac_recomputes_forward_math():
     # doubles (topk/indexer, grouped GEMMs, softmax, router math, and the
     # virtual fusion forward stems), while the backward-side counts keep
     # their single-pass population.
-    assert counts["system3_sim.gdn2_chunked.default"] == 36
-    assert counts["system3_sim.gdn2_chunked_backward.default"] == 18
-    assert counts["system3_sim.swiglu_clamp.default"] == 72
-    assert counts["system3_sim.swiglu_clamp_backward.default"] == 36
-    assert counts["system3_sim.isa_indexer.default"] == 8
-    assert counts["system3_sim.isa_indexer_grad.default"] == 4
-    assert counts["system3_sim.isa_sparse_attention.default"] == 12
-    assert counts["system3_sim.isa_sparse_attention_grad.default"] == 6
+    assert counts["fused.gdn2_chunked.default"] == 36
+    assert counts["fused.gdn2_chunked_backward.default"] == 18
+    assert counts["fused.swiglu_clamp.default"] == 72
+    assert counts["fused.swiglu_clamp_backward.default"] == 36
+    assert counts["fused.isa_indexer.default"] == 8
+    assert counts["fused.isa_indexer_grad.default"] == 4
+    assert counts["fused.isa_sparse_attention.default"] == 12
+    assert counts["fused.isa_sparse_attention_grad.default"] == 6
     assert counts["npu.npu_rms_norm.default"] == 485
     assert counts["npu.npu_rms_norm_backward.default"] == 243
     assert counts["aten.topk.default"] == 36
@@ -200,8 +200,8 @@ def test_system3_multimodal_capture_includes_encoder_gradients():
     # router math.
     assert counts["npu.npu_fusion_attention.default"] == 8
     assert counts["npu.npu_fusion_attention_grad.default"] == 8
-    assert counts["system3_sim.isa_indexer.default"] == 4
-    assert counts["system3_sim.isa_sparse_attention.default"] == 6
+    assert counts["fused.isa_indexer.default"] == 4
+    assert counts["fused.isa_sparse_attention.default"] == 6
     # tok embedding + one modality-segment lookup per encoder; the Engram
     # per-head lookups are host gathers now.
     assert counts["aten.embedding.default"] == 5
@@ -260,7 +260,7 @@ def test_system3_ep2_dispatches_all_to_all_and_reaches_iteration():
     # The routed path accumulates and updates the sparse gradients too: the
     # balanced-exchange lookup keeps the formal autograd boundary, so every
     # table holds pending evidence and executes its SparseAdam update.
-    assert counts["system3_sim.sparse_adam_update.default"] == 3
+    assert counts["fused.sparse_adam_update.default"] == 3
     evidence = workload.iteration.schedule.annotations["sparse_optimizer_validation"]
     # Evidence keys follow the SparseAdam group naming (checkpoint shard
     # suffix at EP degree > 1), so they reconcile against the declared

@@ -185,12 +185,16 @@ _QWEN3_5_OVERRIDES = [
     "torchtitan_npu.override.qwen3_5.gated_delta.npu",
 ]
 
-# SLA2 uses the fused interleave RoPE like the DSV4 families; the rms_norm and
-# ASC MoE dispatcher entries reuse the shared common overrides. The SLA2 branch
+# SLA2 uses the fused interleave RoPE like the DSV4 families; the ASC MoE
+# dispatcher entries reuse the shared common overrides. The SLA2 branch
 # fusions are installed by runtime.configure_model, not through override.imports.
+# multi_head_moe ships its own local RMSNorm class (reference fp32 math), so
+# common.rms_norm.asc cannot reach it; the model-local override mirrors the
+# system3 AscSystem3RMSNorm precedent and only gates the Meta bridge below.
 _MULTI_HEAD_MOE_OVERRIDES = [
     *_COMMON_OVERRIDES,
     "torchtitan_npu.override.common.rope.asc_complex",
+    "torchtitan_npu.override.multi_head_moe.rms_norm.asc",
 ]
 
 # The production A3 text recipe (examples/deepseek_v4_1) enables rms_norm, the
@@ -258,12 +262,17 @@ PRESET_FACTORIES = {
     "system3_debugmodel_multimodal": "torchtitan_npu.models.system3.config_registry.system3_debugmodel_multimodal",
     "system3_full_text": "torchtitan_npu.models.system3.config_registry.system3_full_text",
     "system3_full_multimodal": "torchtitan_npu.models.system3.config_registry.system3_full_multimodal",
+    "system3_preview40t_text": "torchtitan_npu.models.system3.config_registry.system3_preview40t_text",
+    "system3_preview40t_multimodal": "torchtitan_npu.models.system3.config_registry.system3_preview40t_multimodal",
+    "system3_preview40t_l20_multimodal": "torchtitan_npu.models.system3.config_registry.system3_preview40t_l20_multimodal",
     "system3_unit_text": "torchtitan_npu.models.system3.config_registry.system3_unit_text",
     "qwen3_5_debugmodel": "torchtitan_simulator.presets.qwen3_5_debugmodel",
     "qwen3_5_debugmodel_moe": "torchtitan_simulator.presets.qwen3_5_debugmodel_moe",
     "deepseek_v4_1_debugmodel_text": "torchtitan_simulator.presets.deepseek_v4_1_debugmodel_text",
     "multi_head_moe_debugmodel": "torchtitan_simulator.presets.multi_head_moe_debugmodel",
     "multi_head_moe_debugmodel_head_parallel": "torchtitan_simulator.presets.multi_head_moe_debugmodel_head_parallel",
+    "multi_head_moe_2p5t": "torchtitan_simulator.presets.multi_head_moe_2p5t",
+    "multi_head_moe_2p5t_head_parallel": "torchtitan_simulator.presets.multi_head_moe_2p5t_head_parallel",
 }
 
 

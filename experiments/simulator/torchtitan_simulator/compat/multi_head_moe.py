@@ -15,7 +15,7 @@ no public CANN anchor). The eager fallbacks materialize the full score
 matrix and per-block states, which misrepresents the architecture's
 execution, so the simulator exposes the two fused boundaries as virtual
 custom ops with fake Meta kernels and explicit backward ops — the same
-pattern as Kimi's ``kimi_sim`` and Qwen3.5's ``qwen3_5_sim`` fusions.
+pattern as the Kimi and Qwen3.5 fused-boundary fusions.
 Real-device calls fail explicitly. Installation is opt-in: the simulator
 replaces the seams only when ``SimulationConfig.enable_sla2_fusion`` is set
 (default off, eager reference operators).
@@ -90,7 +90,7 @@ def _register_fusion_semantics(
     )
 
 
-@torch.library.custom_op("multi_head_moe_sim::sla2_sparse_attention", mutates_args=())
+@torch.library.custom_op("fused::sla2_sparse_attention", mutates_args=())
 def sla2_sparse_attention(
     q_BHTD: torch.Tensor,
     k_BHTD: torch.Tensor,
@@ -112,7 +112,7 @@ def _sla2_sparse_meta(q_BHTD, k_BHTD, v_BHTD, block_mask_BHqq, selected_blocks):
     return torch.empty_like(q_BHTD)
 
 
-@torch.library.custom_op("multi_head_moe_sim::sla2_sparse_attention_grad", mutates_args=())
+@torch.library.custom_op("fused::sla2_sparse_attention_grad", mutates_args=())
 def sla2_sparse_attention_grad(
     q_BHTD: torch.Tensor,
     k_BHTD: torch.Tensor,
@@ -156,7 +156,7 @@ def _sparse_backward(ctx, dy):
 sla2_sparse_attention.register_autograd(_sparse_backward, setup_context=_sparse_setup)
 
 
-@torch.library.custom_op("multi_head_moe_sim::sla2_linear_attention", mutates_args=())
+@torch.library.custom_op("fused::sla2_linear_attention", mutates_args=())
 def sla2_linear_attention(
     q_BHTD: torch.Tensor,
     k_BHTD: torch.Tensor,
@@ -178,7 +178,7 @@ def _sla2_linear_meta(q_BHTD, k_BHTD, v_BHTD, complement_mask_BHqq, selected_blo
     return torch.empty_like(q_BHTD)
 
 
-@torch.library.custom_op("multi_head_moe_sim::sla2_linear_attention_grad", mutates_args=())
+@torch.library.custom_op("fused::sla2_linear_attention_grad", mutates_args=())
 def sla2_linear_attention_grad(
     q_BHTD: torch.Tensor,
     k_BHTD: torch.Tensor,

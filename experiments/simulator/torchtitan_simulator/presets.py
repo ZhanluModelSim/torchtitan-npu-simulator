@@ -78,6 +78,36 @@ def multi_head_moe_debugmodel_head_parallel(*, num_mtp_layers: int = 0):
     return _factory()
 
 
+def multi_head_moe_2p5t(*, num_mtp_layers: int = 0):
+    """SLA2 + Multi-Head-MoE trainer at the published 2.5T preview geometry.
+
+    Field-for-field from the pristine reference ``ModelArgs``: dim=8192,
+    80 layers, 64 heads x 128 hd, MoE 32 heads x 896 experts-per-head with
+    K=16, 1536-wide routed experts, 4096-wide shared expert, vocab 102400.
+    """
+    if num_mtp_layers:
+        raise ValueError("multi_head_moe has no MTP modules; num_mtp_layers must be 0")
+    from torchtitan_npu.models.multi_head_moe.config_registry import multi_head_moe_2p5t as _factory
+
+    return _factory()
+
+
+def multi_head_moe_2p5t_head_parallel(*, num_mtp_layers: int = 0):
+    """Head-parallel variant of the 2.5T-geometry SLA2 + Multi-Head-MoE trainer.
+
+    Same 2.5T geometry; the MoE layers swap to ``HeadParallelMultiHeadMoE``
+    (static head-ownership all-to-alls instead of token-choice dispatch).
+    ``moe_heads`` 32 accepts expert parallel degrees up to 32.
+    """
+    if num_mtp_layers:
+        raise ValueError("multi_head_moe has no MTP modules; num_mtp_layers must be 0")
+    from torchtitan_npu.models.multi_head_moe.config_registry import (
+        multi_head_moe_2p5t_head_parallel as _factory,
+    )
+
+    return _factory()
+
+
 def _deepseek_v4_1_trainer_config(factory_name: str, *, num_mtp_layers: int = 0):
     """Build a native DeepSeek-V4.1 TrainerEx.Config through the main package.
 

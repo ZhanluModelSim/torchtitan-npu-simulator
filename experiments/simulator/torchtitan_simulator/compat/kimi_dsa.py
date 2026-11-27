@@ -21,7 +21,7 @@ from torchtitan_simulator.capture.tensor_semantics import (
 )
 
 
-@torch.library.custom_op("kimi_sim::dsa_indexer", mutates_args=())
+@torch.library.custom_op("fused::dsa_indexer", mutates_args=())
 def dsa_indexer(q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor, topk: int) -> torch.Tensor:
     raise RuntimeError("Kimi virtual DSA indexer is available only for Meta simulation")
 
@@ -52,7 +52,7 @@ def _validate_attention(q, k, v, indices):
         raise ValueError("DSA attention tensors must share dtype and placement")
 
 
-@torch.library.custom_op("kimi_sim::dsa_attention", mutates_args=())
+@torch.library.custom_op("fused::dsa_attention", mutates_args=())
 def dsa_attention(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, indices: torch.Tensor, scale: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -69,7 +69,7 @@ def _attention_meta(q, k, v, indices, scale):
     return out, lse
 
 
-@torch.library.custom_op("kimi_sim::dsa_attention_grad", mutates_args=())
+@torch.library.custom_op("fused::dsa_attention_grad", mutates_args=())
 def dsa_attention_grad(
     q: torch.Tensor,
     k: torch.Tensor,

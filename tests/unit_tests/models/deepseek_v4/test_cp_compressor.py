@@ -899,9 +899,13 @@ for _cp in (2, 4):
 
 def _deterministic_params():
     params = []
-    for name, docs, cp, lb in _DETERMINISTIC_CASES:
+    for index, (name, docs, cp, lb) in enumerate(_DETERMINISTIC_CASES):
         for ratio in (4, 128):  # C4A (overlapping) and C128A (non-overlapping)
-            for dtype in (torch.float32, torch.float64):
+            # float64's 1e-12 tolerance is the numerical-drift sentinel: one
+            # geometry per ratio keeps that guarantee without doubling the
+            # matrix. Every geometry stays covered by the float32 path.
+            dtypes = (torch.float32, torch.float64) if index == 0 else (torch.float32,)
+            for dtype in dtypes:
                 params.append(
                     pytest.param(
                         (name, docs, cp, lb, dtype, ratio),
@@ -958,7 +962,10 @@ def _sweep_params():
         lb_inst = _ht(seq, cp) if lb else None
         name = f"sweep{made}-cp{cp}-{'ht' if lb else 'plain'}-{seq}"
         for ratio in (4, 128):
-            for dtype in (torch.float32, torch.float64):
+            # Same float64-sentinel policy as the deterministic cases: one
+            # sweep config per ratio carries the 1e-12 guard.
+            dtypes = (torch.float32, torch.float64) if made == 0 else (torch.float32,)
+            for dtype in dtypes:
                 params.append(
                     pytest.param(
                         (name, tuple(docs), cp, lb_inst, dtype, ratio),

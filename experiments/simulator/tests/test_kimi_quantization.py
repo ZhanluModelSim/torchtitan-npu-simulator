@@ -59,12 +59,12 @@ def test_kimi_native_mxfp8_quantizes_experts_without_changing_situ_or_gradient_c
     raw_ops = {event.raw_op_type for event in events}
     assert "npu.npu_quant_matmul.default" in raw_ops
     assert "npu.npu_grouped_matmul.default" in raw_ops
-    assert "kimi_sim.situ_glu.default" in raw_ops and "kimi_sim.situ_glu_backward.default" in raw_ops
+    assert "fused.situ_glu.default" in raw_ops and "fused.situ_glu_backward.default" in raw_ops
     assert not any("swiglu" in op.lower() for op in raw_ops)
     forward_situ = [
         event
         for event in events
-        if event.raw_op_type == "kimi_sim.situ_glu.default" and event.execution_kind != "recompute"
+        if event.raw_op_type == "fused.situ_glu.default" and event.execution_kind != "recompute"
     ]
     assert len(forward_situ) == 7
     assert any(ref.dtype == "float8_e4m3fn" for event in events for ref in event.outputs)
