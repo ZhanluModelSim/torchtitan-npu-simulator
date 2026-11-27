@@ -22,8 +22,12 @@ measured NPU run launches one aclnn kernel per chain member (no aclnnRmsNorm /
 fused rotary in the kernel trace).  Capture sessions route them through the
 vendor fused operators (``npu.npu_rms_norm`` / ``npu.npu_rotary_mul``) to keep
 the captured graph compact; per-op correspondence with the production trace is
-intentionally surrendered for these chains.  Non-fp32 inputs and partial or
-odd rotation widths keep the reference chain.
+intentionally surrendered for these chains.  float32 and bfloat16 activations
+are covered; other dtypes and partial or odd rotation widths keep the
+reference chain.  The local token dispatcher's stable argsort plus
+deterministic scatter-add is likewise fused into the vendor
+``npu_moe_token_permute`` / ``npu_moe_token_unpermute`` boundary, matching the
+production MoE dispatcher kernels (fp32-internal score multiply and top-K sum).
 """
 
 import torch
@@ -131,9 +135,13 @@ def _sdpa_bridge(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=Fal
 def _install_sys2mot_norm_rotary(scope) -> dict[str, str]:
     """Route sys2mot RMSNorm and rotary-apply through vendor fused kernels.
 
-    Only float32 full-precision calls are covered; everything else keeps the
-    reference eager chain.  Frequency/angle computation stays verbatim so the
-    captured cos/sin kernels keep matching the production trace.
+    float32 and bfloat16 calls are covered; everything else keeps the
+    reference eager chain.  The MoE token dispatcher takes the fused
+    ``npu_moe_token_permute``/``npu_moe_token_unpermute`` boundary via the
+    ``override.imports`` policy entry (``token_dispatcher.asc``), which swaps
+    the shared AllToAll dispatcher config for ``AscAllToAllTokenDispatcher``.
+    Frequency/angle computation stays verbatim so the captured cos/sin
+    kernels keep matching the production trace.
     """
     import torch_npu
 
@@ -149,19 +157,19 @@ def _install_sys2mot_norm_rotary(scope) -> dict[str, str]:
     reference_rotary = sys2mot_model.rotary
 
     def rms_norm_forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dtype is not torch.float32:
+        if x.dtype not in (torch.float32, torch.bfloat16):
             return reference_rms_forward(self, x)
         return torch_npu.npu_rms_norm(x, self.weight, self.eps)[0]
 
     def rotary_forward(x, pos, dim, theta=10000.0, inverse=False):
-        if x.dtype is not torch.float32 or dim % 2 or dim > x.size(-1):
+        if x.dtype not in (torch.float32, torch.bfloat16) or dim % 2 or dim > x.size(-1):
             return reference_rotary(x, pos, dim, theta, inverse)
         freq = theta ** (-torch.arange(0, dim, 2, device=x.device).float() / dim)
         angles = pos.float()[..., None] * freq
         angles = angles[None, :, None] if pos.ndim == 1 else angles[:, :, None]
         if inverse:
             angles = -angles
-        cosine, sine = angles.cos(), angles.sin()
+        cosine, sine = angles.cos().to(x.dtype), angles.sin().to(x.dtype)
         tail_input = x if dim == x.size(-1) else x[..., -dim:]
         rotated = torch_npu.npu_rotary_mul(tail_input, cosine, sine, rotary_mode="half")
         if dim == x.size(-1):
@@ -177,10 +185,28 @@ def _install_sys2mot_norm_rotary(scope) -> dict[str, str]:
 
 def install_sys2mot_meta_support(scope):
     """Install all capture-session Meta bridges for the sys2mot model."""
-    import torch.nn.functional as functional
 
-    scope.replace(functional, "scaled_dot_product_attention", _sdpa_bridge)
-    return _install_sys2mot_norm_rotary(scope)
+    from torchtitan_simulator.compat.sys2mot_compressor import (
+        install_sys2mot_compressor_meta_support,
+    )
+    from torchtitan_simulator.compat.sys2mot_csa import install_sys2mot_csa_meta_support
+    from torchtitan_simulator.compat.sys2mot_engram import install_sys2mot_engram_meta_support
+    from torchtitan_simulator.compat.sys2mot_mhc import install_sys2mot_mhc_meta_support
+    from torchtitan_simulator.compat.sys2mot_router import install_sys2mot_router_meta_support
+    from torchtitan_simulator.compat.sys2mot_sparse_attention import (
+        install_sys2mot_sparse_attention_meta_support,
+    )
+    from torchtitan_simulator.compat.sys2mot_swiglu import install_sys2mot_swiglu_meta_support
+
+    status = _install_sys2mot_norm_rotary(scope)
+    status.update(install_sys2mot_engram_meta_support(scope))
+    status.update(install_sys2mot_csa_meta_support(scope))
+    status.update(install_sys2mot_sparse_attention_meta_support(scope))
+    status.update(install_sys2mot_mhc_meta_support(scope))
+    status.update(install_sys2mot_swiglu_meta_support(scope))
+    status.update(install_sys2mot_router_meta_support(scope))
+    status.update(install_sys2mot_compressor_meta_support(scope))
+    return status
 
 
 __all__ = [

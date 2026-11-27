@@ -280,7 +280,10 @@ class DeepSeekViT(Module):
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         b, views, channels, height, width = images.shape
-        x = self.patch(images.reshape(b * views, channels, height, width))
+        # Reference bf16 training feeds the stem at the compute dtype; the
+        # capture path receives fp32 normalized floats, so mirror the model's
+        # parameter-boundary ``.to(dtype)`` convention here.
+        x = self.patch(images.reshape(b * views, channels, height, width).to(self.patch.weight.dtype))
         gh, gw = x.shape[-2:]
         x = x.flatten(2).transpose(1, 2)
         ypos = torch.arange(gh, device=x.device).repeat_interleave(gw)
@@ -1258,6 +1261,12 @@ class ActionMoT(Module):
     def embed(self, state: torch.Tensor, actions: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if actions.shape != (state.shape[0], self.horizon, self.action_dim) or t.shape != (state.shape[0],):
             raise ValueError("Expected actions [B,50,action_dim], timestep [B]")
+        # Real-valued entries (state/actions/t) arrive at the data dtype; the
+        # stream Linear weights carry the compute dtype under mixed precision,
+        # so cast at the boundary (no-op under fp32 params).
+        state = state.to(self.state_in.weight.dtype)
+        actions = actions.to(self.action_in.weight.dtype)
+        t = t.to(self.state_in.weight.dtype)
         x = torch.cat((self.state_in(state)[:, None], self.action_in(actions) + self.position.to(actions.dtype)), 1)
         # Reference ``nn.Sequential(Linear, SiLU, Linear)`` as leaf modules.
         cond = self.time_out(F.silu(self.time_in(time_embedding(t, self.time_in.out_features).to(state.dtype))))

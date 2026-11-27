@@ -43,26 +43,39 @@ def test_sys2mot_capture_reaches_iteration_with_reference_operators():
     assert result["graph_acyclic"] and result["peak_storage_unique"]
     nodes = [n for template in workload.step_templates.values() for n in template.nodes.values()]
     counts = Counter(n.annotations["raw_op_type"] for n in nodes)
-    # The CSA2/Engram/mHC/action paths are the reference's own eager
-    # operators. The routed experts run three grouped GEMMs per MoE layer
-    # (8 layers), the router scores with sqrt(softplus) in fp32, the CSA2
-    # indexer and the force-balanced MoE routing keep their real topk calls,
-    # and the ViT pixel unshuffle is the reference's own unfold
-    # (im2col/col2im). Distillation is offline in the current form: the
-    # training step is student-only and the teacher's logits/hidden are
-    # inputs the re-enabled distill knob would consume (see
-    # sys2mot-distill-sharded for the archived in-loop form).
+    # The CSA2/Engram/mHC/action paths ride the fused sys2mot_sim training
+    # boundaries. The routed experts run three grouped GEMMs per MoE layer
+    # (8 layers), the router scores with sqrt(softplus) in fp32, and the
+    # force-balanced MoE routing keeps its real topk calls (the CSA2
+    # retrieval selection lives inside csa_indexer), and the ViT pixel
+    # unshuffle is the reference's own unfold (im2col/col2im). Distillation
+    # is offline in the current form: the training step is student-only and
+    # the teacher's logits/hidden are inputs the re-enabled distill knob
+    # would consume (see sys2mot-distill-sharded for the archived in-loop
+    # form).
     assert counts["aten._grouped_mm.default"] == 72
-    assert counts["aten.topk.default"] == 18
-    # Student routers + indexer plus the offline-distillation teacher softmax.
-    assert counts["aten._softmax.default"] == 50
-    assert counts["aten.softplus.default"] == 8
-    assert counts["aten.embedding.default"] == 3  # student text + Engram
-    assert counts["aten.constant_pad_nd.default"] == 40
+    assert counts["aten.topk.default"] == 8
+    # Student routers plus the offline-distillation teacher softmax.
+    assert counts["aten._softmax.default"] == 13
+    # The routers fold sqrt(softplus) into the router_score boundary.
+    assert counts["sys2mot_sim.router_score.default"] == 8
+    assert counts["sys2mot_sim.router_score_backward.default"] == 8
+    assert counts["aten.embedding.default"] == 1  # student text; the Engram
+    # table gather rides the engram_lookup boundary.
+    assert counts["aten.constant_pad_nd.default"] == 14  # the reference's own
+    # remaining pads, plus the eight per-indexer KL chunk-fold pads (the 36
+    # n-gram shift pads are inside ngram_hash and the retrieval masks are
+    # inside csa_indexer).
     assert counts["aten.im2col.default"] == 1
     assert counts["aten.convolution.default"] == 1
-    assert counts["aten.sort.stable"] == 8  # token dispatcher per MoE layer
-    assert counts["torchtitan.deterministic_scatter_add.default"] == 8
+    # The token dispatcher runs the fused local permute/unpermute boundary
+    # (vendor npu_moe_token_permute + the torchtitan_npu wrapper with the
+    # fp32-internal score multiply and top-K sum) instead of the reference's
+    # stable argsort and deterministic scatter-add.
+    assert counts["npu.npu_moe_token_permute.default"] == 8
+    assert counts["torchtitan_npu.npu_moe_token_unpermute.default"] == 8
+    assert "aten.sort.stable" not in counts
+    assert "torchtitan.deterministic_scatter_add.default" not in counts
     # The captured joint loss: flow MSE + 0.1 text CE + 0.01 indexer aux,
     # plus the offline-distillation KD/hidden terms computed on synthetic
     # stand-in teacher tensors (inputs the real offline step loads from the
@@ -72,10 +85,56 @@ def test_sys2mot_capture_reaches_iteration_with_reference_operators():
     assert counts["aten.mse_loss.default"] == 1
     assert counts["aten.nll_loss_forward.default"] == 1
     assert counts["aten.xlogy.Tensor"] == 1
-    assert counts["aten._log_softmax.default"] == 10
-    assert counts["aten._softmax.default"] == 50
-    # Only the sys2mot_sim FlashAttention virtual boundary is substituted;
-    # every other node is a native aten/collective op.
+    assert counts["aten._log_softmax.default"] == 6
+    assert counts["aten._softmax.default"] == 13
+    # The Engram memory (layers 1/3) and the CSA2 retrieval (indexers at
+    # layers 1/2/4/5) ride the sys2mot_sim training boundaries with their
+    # paired backwards.
+    assert counts["sys2mot_sim.ngram_hash.default"] == 2
+    assert counts["sys2mot_sim.engram_lookup.default"] == 2
+    assert counts["sys2mot_sim.engram_gate.default"] == 2
+    assert counts["sys2mot_sim.engram_lookup_backward.default"] == 2
+    assert counts["sys2mot_sim.engram_gate_backward.default"] == 2
+    assert counts["sys2mot_sim.csa_indexer.default"] == 4
+    assert counts["sys2mot_sim.csa_indexer_backward.default"] == 4
+    # The sparse attention (8 layers) rides the window_topk boundary with
+    # its training-only backward. The mHC hyper-connections (two sublayer
+    # plans per block plus the two final-norm collapses) ride the mix,
+    # collapse and expand boundaries.
+    assert counts["sys2mot_sim.window_topk_attention.default"] == 8
+    assert counts["sys2mot_sim.window_topk_attention_backward.default"] == 8
+    assert counts["sys2mot_sim.mhc_mix.default"] == 16
+    assert counts["sys2mot_sim.mhc_mix_backward.default"] == 16
+    assert counts["sys2mot_sim.mhc_collapse.default"] == 18
+    assert counts["sys2mot_sim.mhc_collapse_backward.default"] == 17
+    assert counts["sys2mot_sim.mhc_expand.default"] == 16
+    assert counts["sys2mot_sim.mhc_expand_backward.default"] == 16
+    # The dense MLPs and grouped experts share the clamped-SwiGLU boundary
+    # (26 call sites); the eager clamp/silu/multiply chains are gone.
+    assert counts["sys2mot_sim.swiglu.default"] == 26
+    assert counts["sys2mot_sim.swiglu_backward.default"] == 26
+    assert counts["aten.silu.default"] == 9
+    assert counts["aten.silu_backward.default"] == 9
+    # Every MoE router folds sqrt(softplus) into the router_score boundary
+    # (8 layers); the eager softplus/sqrt chains and the sqrt backward
+    # div/mul glue are gone.
+    assert counts["sys2mot_sim.router_score.default"] == 8
+    assert counts["sys2mot_sim.router_score_backward.default"] == 8
+    assert "aten.softplus.default" not in counts
+    assert "aten.sqrt.default" not in counts
+    # The debug geometry's single ratio>1 compressor folds its gated window
+    # pooling into the compress_pool boundary.
+    assert counts["sys2mot_sim.compress_pool.default"] == 1
+    assert counts["sys2mot_sim.compress_pool_backward.default"] == 1
+    # The retrieval's ReLU pool, chunk masking, candidate generation and
+    # per-chunk topk selection no longer leak as eager operators.
+    assert "aten.einsum.default" not in counts
+    assert "aten.relu.default" not in counts
+    assert "aten.amax.default" not in counts
+    assert counts["aten.gather.default"] == 8
+    # Only the sys2mot_sim virtual boundaries (FlashAttention, Engram,
+    # CSA2 retrieval) are substituted; every other node is a native
+    # aten/collective op.
     assert not any(raw.startswith(("sys2mot.", "system3.", "deepseek_v4.")) for raw in counts)
     # The aux-loss-free routing-bias update (bincount/nonzero on Meta) is
     # skipped under the capture's force-load-balance debug flag; the real
@@ -97,11 +156,26 @@ def test_sys2mot_capture_reaches_iteration_with_reference_operators():
     assert counts["npu.npu_rms_norm_backward.default"] == 75
     assert counts["npu.npu_rotary_mul.default"] == 64
     assert counts["npu.npu_rotary_mul_backward.default"] == 64
-    # Only the FlashAttention virtual boundary declares tensor roles.
+    # The Engram memory (layers 1/3) rides the sys2mot_sim training
+    # boundaries: rolling Horner hash with eligibility, row gather, and the
+    # fp32 RMS/SSR gate, each with its training-only backward.
+    assert counts["sys2mot_sim.ngram_hash.default"] == 2
+    assert counts["sys2mot_sim.engram_lookup.default"] == 2
+    assert counts["sys2mot_sim.engram_gate.default"] == 2
+    assert counts["sys2mot_sim.engram_lookup_backward.default"] == 2
+    assert counts["sys2mot_sim.engram_gate_backward.default"] == 2
+    # The gate's sign/sigmoid/norm math and the hash's integer remainder
+    # chain no longer leak as eager operators.
+    assert "aten.sign.default" not in counts
+    assert counts["aten.remainder.Scalar"] == 11
+    # Only the FlashAttention virtual boundary and the shared MoE dispatch
+    # wrappers declare tensor roles.
     assert all(
         "tensor_semantics" not in n.attrs
         for n in nodes
-        if not str(n.annotations["raw_op_type"]).startswith("sys2mot_sim.")
+        if not str(n.annotations["raw_op_type"]).startswith(
+            ("sys2mot_sim.", "torchtitan_npu.npu_moe_")
+        )
     )
 
 
@@ -114,11 +188,11 @@ def test_sys2mot_full_ac_recomputes_forward_math():
     nodes = [n for template in workload.step_templates.values() for n in template.nodes.values()]
     counts = Counter(n.annotations["raw_op_type"] for n in nodes)
     # Full AC recomputes the forward inside backward: the grouped GEMMs,
-    # router scoring and indexer topk recompute once more, while the
+    # router scoring and retrieval boundary recompute once more, while the
     # loss/optimizer signatures keep their counts.
     assert counts["aten._grouped_mm.default"] == 96
-    assert counts["aten.topk.default"] == 36
-    assert counts["aten.softplus.default"] == 16
+    assert counts["aten.topk.default"] == 16
+    assert counts["sys2mot_sim.router_score.default"] == 16
     gradients = workload.iteration.schedule.annotations["gradient_validation"]
     assert len(gradients) == _PARAM_TENSORS
 
@@ -137,10 +211,9 @@ def test_sys2mot_selective_ac_gmm_save_set_skips_grouped_gemm_recompute():
     nodes = [n for template in workload.step_templates.values() for n in template.nodes.values()]
     counts = Counter(n.annotations["raw_op_type"] for n in nodes)
     # The gmm save-set keeps the student grouped GEMMs saved (forward count
-    # only); the indexer/router topk is not part of the saved set and
-    # recomputes.
+    # only); the router topk is not part of the saved set and recomputes.
     assert counts["aten._grouped_mm.default"] == 72
-    assert counts["aten.topk.default"] == 36
+    assert counts["aten.topk.default"] == 16
     gradients = workload.iteration.schedule.annotations["gradient_validation"]
     assert len(gradients) == _PARAM_TENSORS
 

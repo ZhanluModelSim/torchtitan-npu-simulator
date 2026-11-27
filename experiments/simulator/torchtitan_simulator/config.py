@@ -360,10 +360,12 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
                 "qwen3": _QWEN3_OVERRIDES,
                 "qwen3_5": _QWEN3_5_OVERRIDES,
                 "system3": _SYSTEM3_OVERRIDES,
-                # sys2mot reproduces the reference's own RMSNorm math and uses
-                # the shared LocalTokenDispatcher, so neither AscendC override
-                # applies to its config tree.
-                "sys2mot": [],
+                # sys2mot reproduces the reference's own RMSNorm math (the
+                # compat module bridges its own classes), so the shared
+                # RMSNorm/rotary config overrides find no target in its tree;
+                # its dispatcher config is the shared AllToAll one, so the
+                # fused npu_moe_token_permute/unpermute boundary applies.
+                "sys2mot": ["torchtitan_npu.override.common.token_dispatcher.asc"],
             }[trainer.model_spec.name]
         )
         if simulation.override_imports is None
