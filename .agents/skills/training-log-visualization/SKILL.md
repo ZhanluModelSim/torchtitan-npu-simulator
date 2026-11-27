@@ -65,13 +65,13 @@ python .agents/skills/training-log-visualization/scripts/plot_training_logs.py \
 
 ### Step 3：绘制完成后询问是否生成 PR 贴图小文件
 
-- 首次绘图完成后，**必须先询问用户**是否需要额外生成一张小于 `200 KB`（`200,000` 字节）的 PNG 用于 PR 贴图。
+- 首次绘图完成后，**必须先询问用户**是否需要额外生成一张小于 `50 KB`（`50,000` 字节）的 PNG 用于 PR 贴图。
 - 不得默认生成 PR 贴图小文件。
 - 用户确认需要后，再次调用脚本并附加参数：
   - `--generate-pr-image`
   - 可选：`--pr-image-output /path/to/pr_image.png`
-- PR 图保持主图自身的宽高比，不固定为 `1024x768`；脚本通过降低 PNG 渲染分辨率将文件严格控制在 `200 KB` 以下。
-- 若未提供 `--pr-image-output`，默认与主图输出在同一目录，文件名为：`<主输出文件名>_pr_under_200kb.png`。
+- PR 图保持主图自身的宽高比，不固定为 `1024x768`；脚本通过降低 PNG 渲染分辨率将文件严格控制在 `50 KB` 以下。
+- 若未提供 `--pr-image-output`，默认与主图输出在同一目录，文件名为：`<主输出文件名>_pr_under_50kb.png`。
 
 PR 贴图小文件示例（在原命令基础上追加）：
 
@@ -88,7 +88,7 @@ python .agents/skills/training-log-visualization/scripts/plot_training_logs.py \
 输出必须包含：
 
 - 主图路径
-- （若用户要求）小于 `200 KB` 的 PR 图路径
+- （若用户要求）小于 `50 KB` 的 PR 图路径
 - 解析到的 step 范围和关键摘要
 - 对齐告警（例如双日志 step 不一致）
 - 指标缺失告警（若某些可选指标不存在）

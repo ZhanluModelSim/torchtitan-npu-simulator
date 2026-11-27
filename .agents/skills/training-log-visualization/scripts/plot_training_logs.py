@@ -48,7 +48,7 @@ def _parse_metric_list(raw: str) -> list[str]:
     return [_normalize_metric(item.strip()) for item in raw.split(",") if item.strip()]
 
 
-PR_IMAGE_MAX_BYTES = 200_000
+PR_IMAGE_MAX_BYTES = 50_000
 PR_IMAGE_INITIAL_DPI = 150.0
 PR_IMAGE_MIN_DPI = 1.0
 PR_IMAGE_MAX_ATTEMPTS = 12
@@ -74,7 +74,7 @@ def _default_output_path(log_a: str, log_b: str | None, output_format: str) -> P
 
 
 def _default_pr_image_output_path(output: Path) -> Path:
-    return output.with_name(f"{output.stem}_pr_under_200kb.png")
+    return output.with_name(f"{output.stem}_pr_under_50kb.png")
 
 
 def _resolve_pr_image_output(
@@ -181,7 +181,7 @@ def _metric_label(metric_key: str) -> str:
     labels = {
         "loss": "loss",
         "grad_norm": "grad_norm",
-        "memory_gib": "memory (GB)",
+        "memory_gib": "memory (GiB)",
         "memory_pct": "memory (%)",
         "tps": "tps",
         "tflops": "tflops",
@@ -640,12 +640,12 @@ def main() -> int:
     parser.add_argument(
         "--generate-pr-image",
         action="store_true",
-        help="also export an extra PNG below 200 KB for PR embedding",
+        help="also export an extra PNG below 50 KB for PR embedding",
     )
     parser.add_argument(
         "--pr-image-output",
         default=None,
-        help="optional path for the PR image below 200 KB (.png)",
+        help="optional path for the PR image below 50 KB (.png)",
     )
     parser.add_argument("--title", default=None, help="figure title")
     parser.add_argument(

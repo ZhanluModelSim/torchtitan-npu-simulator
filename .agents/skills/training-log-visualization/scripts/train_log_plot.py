@@ -33,7 +33,9 @@ TPS_RE = re.compile(rf"\btps:\s*{NUM_RE}{NUM_END_RE}")
 TFLOPS_RE = re.compile(rf"\btflops:\s*{NUM_RE}{NUM_END_RE}")
 MFU_RE = re.compile(rf"\bmfu:\s*{NUM_RE}%(?![\w.])")
 ELAPSED_RE = re.compile(rf"\belapsed_time_per_step:\s*{NUM_RE}s(?![\w.])")
-INDEXER_LOSS_RE = re.compile(rf"\bindexer\s+loss:\s*{NUM_RE}{NUM_END_RE}")
+# torchtitan-npu prints aux losses on their own line.
+AUX_STEP_RE = re.compile(rf"\baux_loss\s+step:\s*{NUM_RE}{NUM_END_RE}")
+INDEXER_LOSS_RE = re.compile(rf"\bindexer[\s_]+loss(?:/mean)?:\s*{NUM_RE}{NUM_END_RE}")
 
 
 @dataclass(frozen=True)
@@ -85,16 +87,34 @@ def read_training_metrics(log_path: str | Path) -> tuple[list[dict], list[str]]:
     malformed_lines = 0
     duplicate_steps = 0
     pending_indexer_loss: float | None = None
+    pending_elapsed: float | None = None
+    indexer_by_step: dict[int, float] = {}
+    last_record: dict | None = None
 
     with path.open("r", encoding="utf-8", errors="replace") as handle:
         for line_no, raw_line in enumerate(handle, start=1):
             line = _clean_line(raw_line)
 
             line_indexer_loss = _search_float(INDEXER_LOSS_RE, line)
-            if line_indexer_loss is not None:
-                pending_indexer_loss = line_indexer_loss
+            line_elapsed = _search_float(ELAPSED_RE, line)
 
             if "step:" not in line or "loss:" not in line:
+                # Aux-loss and elapsed-time lines are printed separately from the
+                # metrics line. The aux line carries its own step; the elapsed
+                # line does not, so it belongs to the most recent metrics record.
+                if line_indexer_loss is not None:
+                    aux_step = _search_float(AUX_STEP_RE, line)
+                    if _is_valid_step(aux_step):
+                        indexer_by_step[int(aux_step)] = line_indexer_loss
+                    elif last_record is not None:
+                        last_record.setdefault("indexer_loss", line_indexer_loss)
+                    else:
+                        pending_indexer_loss = line_indexer_loss
+                if line_elapsed is not None:
+                    if last_record is not None:
+                        last_record.setdefault("elapsed_time_per_step", line_elapsed)
+                    else:
+                        pending_elapsed = line_elapsed
                 continue
 
             step_val = _search_float(STEP_RE, line)
@@ -102,6 +122,7 @@ def read_training_metrics(log_path: str | Path) -> tuple[list[dict], list[str]]:
             if not _is_valid_step(step_val) or loss_val is None:
                 malformed_lines += 1
                 pending_indexer_loss = None
+                pending_elapsed = None
                 continue
 
             step = int(step_val)
@@ -132,9 +153,13 @@ def read_training_metrics(log_path: str | Path) -> tuple[list[dict], list[str]]:
             if mfu_pct is not None:
                 record["mfu_pct"] = mfu_pct
 
-            elapsed = _search_float(ELAPSED_RE, line)
-            if elapsed is not None:
-                record["elapsed_time_per_step"] = elapsed
+            # elapsed_time_per_step may sit on this line or on the separate line
+            # that follows it; the latter was captured into pending_elapsed.
+            if line_elapsed is not None:
+                record["elapsed_time_per_step"] = line_elapsed
+            elif pending_elapsed is not None:
+                record["elapsed_time_per_step"] = pending_elapsed
+            pending_elapsed = None
 
             indexer_loss = line_indexer_loss
             if indexer_loss is None:
@@ -148,6 +173,13 @@ def read_training_metrics(log_path: str | Path) -> tuple[list[dict], list[str]]:
                 warnings.append(f"duplicate step {step} at line {line_no}, keep latest record")
 
             records_by_step[step] = record
+            last_record = record
+
+    # Aux-loss lines that carried an explicit step are attributed after the fact,
+    # so their position relative to the metrics line does not matter.
+    for step, record in records_by_step.items():
+        if "indexer_loss" not in record and step in indexer_by_step:
+            record["indexer_loss"] = indexer_by_step[step]
 
     records = [records_by_step[s] for s in sorted(records_by_step)]
     if malformed_lines:
