@@ -70,6 +70,7 @@ from torch.distributed.tensor import DTensor
 from torch.profiler import record_function
 
 from torchtitan_npu.extensions.cpu_offload.runtime import local_tensor
+from torchtitan_npu.patches.torch.distributed.fsdp import foreach_reduce as foreach_reduce_owner
 
 _PATCH_MARKER = "_torchtitan_npu_fsdp_grad_accum_v1"
 _CHUNK_BYTES = 64 * 1024 * 1024  # NPU bounce-buffer granularity for grad accumulation
@@ -690,53 +691,58 @@ def _cpu_offload_foreach_reduce(
     )
 
 
-def _patched_foreach_reduce(*args: Any, **kwargs: Any) -> Any:
-    """Wrap ``foreach_reduce`` to accumulate CPU-canonical grads on the NPU.
+def _make_foreach_reduce_wrapper(next_foreach_reduce: Any) -> Any:
+    """Wrap ``next_foreach_reduce`` to accumulate CPU-canonical grads on the NPU.
 
     Resolve arguments using the installed PyTorch signature, preserving
     legacy calls and adapting the Torch 2.15 reduce-scatter callback.
     """
-    fsdp_params = args[0] if args else kwargs["fsdp_params"]
-    reduce_params = _FOREACH_REDUCE_PARAMS
-    # Torch 2.15 removed the legacy ``orig_dtype`` positional argument and
-    # added the keyword-only reduce-scatter input preparation callback.
-    device_index = _FOREACH_REDUCE_DEVICE_INDEX
-    if device_index is None:
-        raise RuntimeError("Unsupported FSDP foreach_reduce signature: missing device")
-    device = args[device_index] if len(args) > device_index else kwargs["device"]
-    if not _uses_cpu_canonical_grads(fsdp_params, device):
-        return _ORIGINAL_FOREACH_REDUCE(*args, **kwargs)
-    if "orig_dtype" in reduce_params:
-        return _cpu_offload_foreach_reduce(*args, **kwargs)
 
-    bound = _FOREACH_REDUCE_SIGNATURE.bind(*args, **kwargs)
-    bound.apply_defaults()
-    values = bound.arguments
-    return _cpu_offload_foreach_reduce(
-        fsdp_params=values["fsdp_params"],
-        unsharded_grads=values["unsharded_grads"],
-        reduce_scatter_group=values["reduce_scatter_group"],
-        reduce_scatter_stream=values["reduce_scatter_stream"],
-        reduce_scatter_comm=values["reduce_scatter_comm"],
-        orig_dtype=None,
-        reduce_dtype=values["reduce_dtype"],
-        device=values["device"],
-        gradient_divide_factor=values["gradient_divide_factor"],
-        all_reduce_group=values["all_reduce_group"],
-        all_reduce_stream=values["all_reduce_stream"],
-        all_reduce_grads=values["all_reduce_grads"],
-        partial_reduce_output=values["partial_reduce_output"],
-        all_reduce_hook=values["all_reduce_hook"],
-        force_sum_reduction_for_comms=values["force_sum_reduction_for_comms"],
-        prepare_reduce_scatter_inputs=values["prepare_reduce_scatter_inputs"],
-    )
+    def _patched_foreach_reduce(*args: Any, **kwargs: Any) -> Any:
+        fsdp_params = args[0] if args else kwargs["fsdp_params"]
+        reduce_params = _FOREACH_REDUCE_PARAMS
+        # Torch 2.15 removed the legacy ``orig_dtype`` positional argument and
+        # added the keyword-only reduce-scatter input preparation callback.
+        device_index = _FOREACH_REDUCE_DEVICE_INDEX
+        if device_index is None:
+            raise RuntimeError("Unsupported FSDP foreach_reduce signature: missing device")
+        device = args[device_index] if len(args) > device_index else kwargs["device"]
+        if not _uses_cpu_canonical_grads(fsdp_params, device):
+            return next_foreach_reduce(*args, **kwargs)
+        if "orig_dtype" in reduce_params:
+            return _cpu_offload_foreach_reduce(*args, **kwargs)
+
+        bound = _FOREACH_REDUCE_SIGNATURE.bind(*args, **kwargs)
+        bound.apply_defaults()
+        values = bound.arguments
+        return _cpu_offload_foreach_reduce(
+            fsdp_params=values["fsdp_params"],
+            unsharded_grads=values["unsharded_grads"],
+            reduce_scatter_group=values["reduce_scatter_group"],
+            reduce_scatter_stream=values["reduce_scatter_stream"],
+            reduce_scatter_comm=values["reduce_scatter_comm"],
+            orig_dtype=None,
+            reduce_dtype=values["reduce_dtype"],
+            device=values["device"],
+            gradient_divide_factor=values["gradient_divide_factor"],
+            all_reduce_group=values["all_reduce_group"],
+            all_reduce_stream=values["all_reduce_stream"],
+            all_reduce_grads=values["all_reduce_grads"],
+            partial_reduce_output=values["partial_reduce_output"],
+            all_reduce_hook=values["all_reduce_hook"],
+            force_sum_reduction_for_comms=values["force_sum_reduction_for_comms"],
+            prepare_reduce_scatter_inputs=values["prepare_reduce_scatter_inputs"],
+        )
+
+    _wrap_metadata(_patched_foreach_reduce, next_foreach_reduce, _PATCH_MARKER)
+    return _patched_foreach_reduce
 
 
 # Installation
 # ---------------------------------------------------------------------------
 
-_ORIGINAL_FOREACH_REDUCE: Any = _collectives.foreach_reduce
-_FOREACH_REDUCE_SIGNATURE = signature(_ORIGINAL_FOREACH_REDUCE)
+_ORIGINAL_FOREACH_REDUCE: Any = foreach_reduce_owner.ORIGINAL_FOREACH_REDUCE
+_FOREACH_REDUCE_SIGNATURE = foreach_reduce_owner.FOREACH_REDUCE_SIGNATURE
 _FOREACH_REDUCE_PARAMS = tuple(_FOREACH_REDUCE_SIGNATURE.parameters)
 _FOREACH_REDUCE_DEVICE_INDEX = _FOREACH_REDUCE_PARAMS.index("device") if "device" in _FOREACH_REDUCE_PARAMS else None
 _ORIGINAL_UNSHARD: Any = _param_group.FSDPParamGroup.unshard
@@ -817,7 +823,6 @@ def _wrap_metadata(wrapper: Any, original: Any, marker: str) -> None:
     setattr(wrapper, marker, True)
 
 
-_wrap_metadata(_patched_foreach_reduce, _ORIGINAL_FOREACH_REDUCE, _PATCH_MARKER)
 _wrap_metadata(_patched_unshard, _ORIGINAL_UNSHARD, _PREFETCH_MARKER)
 _wrap_metadata(_patched_wait_for_unshard, _ORIGINAL_WAIT_FOR_UNSHARD, _PREFETCH_MARKER)
 
@@ -831,16 +836,14 @@ def install() -> None:
     alone has no side effects. Without the installation, upstream PyTorch
     FSDP and the CPU-offload gradients are not patched.
     """
-    foreach_reduce_patched = getattr(_collectives.foreach_reduce, _PATCH_MARKER, False)
+    foreach_reduce_patched = foreach_reduce_owner.is_layer_active("cpu_offload")
     unshard_patched = getattr(_param_group.FSDPParamGroup.unshard, _PREFETCH_MARKER, False)
     wait_for_unshard_patched = getattr(_param_group.FSDPParamGroup.wait_for_unshard, _PREFETCH_MARKER, False)
     if foreach_reduce_patched and unshard_patched and wait_for_unshard_patched:
         return
     _validate_upstream_signatures()
     if not foreach_reduce_patched:
-        _collectives.foreach_reduce = _patched_foreach_reduce
-        # ``_fsdp_param_group`` binds the function with a from-import.
-        _param_group.foreach_reduce = _patched_foreach_reduce
+        foreach_reduce_owner.set_layer("cpu_offload", _make_foreach_reduce_wrapper)
     if not unshard_patched:
         _param_group.FSDPParamGroup.unshard = _patched_unshard
     if not wait_for_unshard_patched:
