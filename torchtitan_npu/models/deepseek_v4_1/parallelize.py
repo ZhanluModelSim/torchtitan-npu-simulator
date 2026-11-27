@@ -35,7 +35,7 @@ from torchtitan.experiments.graph_trainer.simple_fsdp import (
 
 from torchtitan_npu.config import ModelCompileConfig
 from torchtitan_npu.models.common.compile_policy import configure_model_compile
-from torchtitan_npu.models.common.fsdp import make_param_dtype_override_fn
+from torchtitan_npu.models.common.fsdp import disable_expert_replication_dims, make_param_dtype_override_fn
 
 from .engram.host import HostEngramTable
 from .model import DeepSeekV41MultimodalModel
@@ -304,6 +304,10 @@ def apply_deepseek_v4_1_fsdp(model, *, parallelism_context, training, parallelis
             parallelism_context=parallelism_context,
         )
 
+    if getattr(parallelism, "disable_expert_replication", False):
+        edp_mesh_dims = disable_expert_replication_dims(
+            model, edp_mesh, edp_mesh_dims, ep_degree=parallelism_context.ep
+        )
     ignored_params = _shard_engram_tables(
         model,
         edp_mesh=edp_mesh if parallelism_context.ep_enabled else dp_mesh,

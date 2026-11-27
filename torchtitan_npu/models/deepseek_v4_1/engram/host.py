@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import cast
@@ -34,12 +35,14 @@ except ImportError:  # torch build without the opaque-object custom-class API
 logger = logging.getLogger(__name__)
 
 
-_JOINT_TABLE_MESHES: dict[tuple[dist.ProcessGroup, dist.ProcessGroup], DeviceMesh] = {}
+_JOINT_TABLE_MESHES: dict[tuple[dist.ProcessGroup, ...], DeviceMesh] = {}
 
 
-def _joint_table_mesh(parallelism_context) -> DeviceMesh:
-    mesh = parallelism_context.get_mesh(["edp_shard", "ep"])
-    key = (mesh.get_group("edp_shard"), mesh.get_group("ep"))
+def _joint_table_mesh(parallelism_context, *, include_dp_replicate: bool = False) -> DeviceMesh:
+    candidate_axes = ("dp_replicate", "edp_shard", "ep") if include_dp_replicate else ("edp_shard", "ep")
+    axes = [axis for axis in candidate_axes if parallelism_context.get_optional_mesh(axis) is not None]
+    mesh = parallelism_context.get_mesh(axes)
+    key = tuple(mesh.get_group(axis) for axis in axes)
     if key not in _JOINT_TABLE_MESHES:
         ranks = mesh.mesh.flatten().tolist()
         group = dist.new_group(ranks=ranks, use_local_synchronization=True)
@@ -64,6 +67,7 @@ class HostEngramTable(EngramTable):
         super().__init__(config)
         self.pin_memory = config.pin_memory
         self.shard_over_efsdp = config.shard_over_efsdp
+        self._shard_over_dp_replicate = False
         self._table_mesh: DeviceMesh | None = None
         self._efsdp_size = 1
         self._ep_rank = 0
@@ -133,10 +137,16 @@ class HostEngramTable(EngramTable):
         if self.shard_over_efsdp:
             if ep_size <= 1:
                 raise ValueError("Engram EFSDP sharding requires EP > 1.")
-            efsdp_mesh = parallelism_context.get_optional_mesh("edp_shard")
-            self._efsdp_size = efsdp_mesh.size() if efsdp_mesh is not None else 1
+            efsdp_axes = ("dp_replicate", "edp_shard") if self._shard_over_dp_replicate else ("edp_shard",)
+            self._efsdp_size = math.prod(
+                m.size() for axis in efsdp_axes if (m := parallelism_context.get_optional_mesh(axis)) is not None
+            )
             if self._efsdp_size > 1:
-                self._table_mesh = _joint_table_mesh(parallelism_context)
+                self._table_mesh = (
+                    _joint_table_mesh(parallelism_context, include_dp_replicate=True)
+                    if self._shard_over_dp_replicate
+                    else _joint_table_mesh(parallelism_context)
+                )
         shard_size = ep_size * self._efsdp_size
         if self.num_embeddings % shard_size != 0:
             raise ValueError(

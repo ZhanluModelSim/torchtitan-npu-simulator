@@ -140,7 +140,7 @@ unsupported = (
     ('optim.optimizer', base_config.optim.optimizer, 'requires TorchFTOptimEx'),
     ('sdc_replayer', object(), 'does not support the upstream SDC replay engine'),
     ('checkpointer.enable_ft_dataloader_checkpoints', False, 'requires checkpoint'),
-    ('parallelism.data_parallel_replicate_degree', 2, 'elastic DP replicas'),
+    ('parallelism.data_parallel_replicate_degree', 2, 'unless disable_expert_replication is enabled'),
     ('parallelism.data_parallel_shard_degree', 1, 'requires both FSDP'),
     ('parallelism.expert_parallel_degree', 1, 'requires both FSDP'),
     ('parallelism.tensor_parallel_degree', 2, 'FSDP+EP only'),
@@ -156,6 +156,39 @@ for path, value, message in unsupported:
         else:
             raise AssertionError(f'accepted unsupported TorchFT configuration: {path}={value!r}')
         initialize.assert_not_called()
+
+from dataclasses import replace as dc_replace
+from torchtitan.config import derive
+from torchtitan_npu.config import ParallelismConfig as NPUParallelismConfig
+
+expert_sharded_ft = make_config()
+expert_sharded_ft = dc_replace(
+    expert_sharded_ft,
+    parallelism=derive(
+        expert_sharded_ft.parallelism,
+        NPUParallelismConfig,
+        data_parallel_replicate_degree=2,
+        disable_expert_replication=True,
+    ),
+)
+assert expert_sharded_ft.parallelism.data_parallel_replicate_degree == 2
+assert expert_sharded_ft.parallelism.disable_expert_replication is True
+module.FaultTolerantTrainerEx._validate_supported_config(expert_sharded_ft)
+
+dedup_muon = dc_replace(expert_sharded_ft.optim.optimizer.optimizers[0], enable_hsdp_replica_dedup=True)
+dedup_optim = dc_replace(
+    expert_sharded_ft.optim,
+    optimizer=dc_replace(
+        expert_sharded_ft.optim.optimizer,
+        optimizers=[dedup_muon, *expert_sharded_ft.optim.optimizer.optimizers[1:]],
+    ),
+)
+try:
+    dc_replace(expert_sharded_ft, optim=dedup_optim)
+except ValueError as error:
+    assert 'incompatible with enable_hsdp_replica_dedup' in str(error)
+else:
+    raise AssertionError('accepted disable_expert_replication with enable_hsdp_replica_dedup')
 
 # Overrides may replace the owner after the early recipe validation.
 engine_config = deepseek_v4_flash_8p_torchft()

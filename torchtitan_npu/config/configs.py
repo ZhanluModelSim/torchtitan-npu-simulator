@@ -12,6 +12,7 @@ from typing import Annotated, Literal
 import tyro
 from torchtitan.components.optim import Optim, OptimizersContainer
 from torchtitan.config import TrainingConfig as _BaseTrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig as _BaseParallelismConfig
 from torchtitan.distributed.flex_shard import BucketConfig, ComputeLayout
 from torchtitan.observability.profiler import Profiler as _BaseProfiler
 
@@ -220,3 +221,24 @@ class ProfilerConfig(_BaseProfiler.Config):
     extension: ProfilerExtensionConfig = field(
         default_factory=ProfilerExtensionConfig,
     )
+
+
+@dataclass(kw_only=True, slots=True)
+class ParallelismConfig(_BaseParallelismConfig):
+    """TorchTitan parallelism configuration with NPU-specific extensions."""
+
+    disable_expert_replication: bool = False
+    """Shard routed experts across dense HSDP replicas so experts keep replica degree 1."""
+
+    def __post_init__(self) -> None:
+        base_post_init = getattr(_BaseParallelismConfig, "__post_init__", None)
+        if base_post_init is not None:
+            base_post_init(self)
+        if not self.disable_expert_replication:
+            return
+        if self.data_parallel_replicate_degree <= 1:
+            raise ValueError("disable_expert_replication requires data_parallel_replicate_degree > 1")
+        if self.expert_parallel_degree <= 1:
+            raise ValueError("disable_expert_replication requires expert_parallel_degree > 1")
+        if self.tensor_parallel_degree != 1 or self.context_parallel_degree != 1 or self.pipeline_parallel_degree != 1:
+            raise ValueError("disable_expert_replication currently requires TP=CP=PP=1")

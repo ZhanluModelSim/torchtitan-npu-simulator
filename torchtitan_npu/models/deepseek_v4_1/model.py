@@ -39,7 +39,7 @@ description.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 import torch_remat as remat
@@ -325,9 +325,14 @@ class DeepSeekV41Model(GeometryAttentionMetadataMixin, Decoder):
     def parallelize(self, **kwargs):
         from .parallelize import validate_deepseek_v4_1_parallelism
 
-        validate_deepseek_v4_1_parallelism(
-            self.config, training=kwargs.get("training"), parallelism=kwargs["parallelism"]
-        )
+        parallelism = kwargs["parallelism"]
+        validate_deepseek_v4_1_parallelism(self.config, training=kwargs.get("training"), parallelism=parallelism)
+        if getattr(parallelism, "disable_expert_replication", False):
+            from .engram.host import HostEngramTable
+
+            for module in self.modules():
+                if isinstance(module, HostEngramTable) and module.shard_over_efsdp:
+                    module._shard_over_dp_replicate = True
         return super().parallelize(**kwargs)
 
     @classmethod
@@ -353,6 +358,7 @@ class DeepSeekV41Model(GeometryAttentionMetadataMixin, Decoder):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
+        _supports_disable_expert_replication: ClassVar[bool] = True
         n_layers: int
         hc_mult: int = 4
         compress_ratios: tuple[int, ...]
@@ -835,13 +841,13 @@ class _GraphTrainerDeepSeekV41Model(GraphTrainerModel):
 class GraphTrainerDeepSeekV41Model(_GraphTrainerDeepSeekV41Model, DeepSeekV41Model):
     @dataclass(kw_only=True, slots=True)
     class Config(DeepSeekV41Model.Config):
-        pass
+        _supports_disable_expert_replication: ClassVar[bool] = False
 
 
 class GraphTrainerDeepSeekV41MultimodalModel(_GraphTrainerDeepSeekV41Model, DeepSeekV41MultimodalModel):
     @dataclass(kw_only=True, slots=True)
     class Config(DeepSeekV41MultimodalModel.Config):
-        pass
+        _supports_disable_expert_replication: ClassVar[bool] = False
 
     def __init__(self, config: Config):
         super().__init__(config)

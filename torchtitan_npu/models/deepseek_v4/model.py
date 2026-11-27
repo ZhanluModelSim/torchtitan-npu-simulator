@@ -5,7 +5,7 @@
 
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import spmd_types as spmd
 import torch
@@ -83,14 +83,41 @@ class DeepSeekV4Model(GeometryAttentionMetadataMixin, TorchTitanV4Model):
                         f"with mixed_precision_param='bfloat16', got {parameter.dtype}. "
                         "Use FP32 master parameters or mixed_precision_param='float32'."
                     )
-        super()._apply_fsdp(
-            parallelism_context=parallelism_context,
-            training=training,
-            parallelism=parallelism,
+        if not getattr(parallelism, "disable_expert_replication", False):
+            super()._apply_fsdp(
+                parallelism_context=parallelism_context,
+                training=training,
+                parallelism=parallelism,
+            )
+            return
+
+        from torchtitan.config import TORCH_DTYPE_MAP
+        from torchtitan.distributed.fsdp import resolve_fsdp_mesh, resolve_sparse_fsdp_mesh
+        from torchtitan.models.deepseek_v3.mtp import apply_fsdp_to_mtp_decoder
+
+        from torchtitan_npu.models.common.fsdp import disable_expert_replication_dims
+
+        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallelism_context)
+        edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallelism_context)
+        edp_mesh_dims = disable_expert_replication_dims(self, edp_mesh, edp_mesh_dims, ep_degree=parallelism_context.ep)
+        apply_fsdp_to_mtp_decoder(
+            self,  # pyrefly: ignore [bad-argument-type]
+            dp_mesh,
+            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+            pp_enabled=parallelism_context.pp_enabled,
+            cpu_offload=training.enable_cpu_offload,
+            reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+            ep_degree=parallelism_context.ep,
+            edp_mesh=edp_mesh,
+            dp_mesh_dims=dp_mesh_dims,
+            edp_mesh_dims=edp_mesh_dims,
+            symm_mem_scope=parallelism.fsdp_symm_mem_scope,
         )
 
     @dataclass(kw_only=True, slots=True)
     class Config(TorchTitanV4Model.Config):
+        _supports_disable_expert_replication: ClassVar[bool] = True
         mtp_isolate_gradients: bool = False
         vocab_size: int
         compress_ratios: tuple[int, ...]
@@ -277,7 +304,7 @@ class GraphTrainerDeepSeekV4Model(DeepSeekV4Model):
 
     @dataclass(kw_only=True, slots=True)
     class Config(DeepSeekV4Model.Config):
-        pass
+        _supports_disable_expert_replication: ClassVar[bool] = False
 
     def _get_attention_metadata(
         self,

@@ -16,6 +16,7 @@ import tyro
 from torchtitan.components.optim import DistMuon
 from torchtitan.components.checkpointer.base import BaseCheckpointManager
 from torchtitan.config import derive
+from torchtitan.config.parallelism import ParallelismConfig as _BaseParallelismConfig
 from torchtitan.trainer import Trainer
 from torchtitan.training_engine import TrainingEngine
 
@@ -25,6 +26,7 @@ from torchtitan_npu.config.configs import (
     ExtensionConfig,
     OptimConfig,
     OptimizerConfig,
+    ParallelismConfig,
     TrainingConfig,
 )
 from torchtitan_npu.config.converters import TrainerConfigConverter
@@ -41,6 +43,33 @@ from .tools.profiler import CANNProfiler
 
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_expert_replication(config: object) -> None:
+    """Validate routed-expert replica sharding across construction and recipe mutations."""
+    parallelism = getattr(config, "parallelism", None)
+    if parallelism is None or not getattr(parallelism, "disable_expert_replication", False):
+        return
+    if parallelism.data_parallel_replicate_degree <= 1:
+        raise ValueError("disable_expert_replication requires data_parallel_replicate_degree > 1")
+    if parallelism.expert_parallel_degree <= 1:
+        raise ValueError("disable_expert_replication requires expert_parallel_degree > 1")
+    if (
+        parallelism.tensor_parallel_degree != 1
+        or parallelism.context_parallel_degree != 1
+        or parallelism.pipeline_parallel_degree != 1
+    ):
+        raise ValueError("disable_expert_replication currently requires TP=CP=PP=1")
+    if getattr(config, "_supports_graph_compile", False):
+        raise ValueError("disable_expert_replication is not supported by GraphTrainer")
+    if not getattr(getattr(config, "model", None), "_supports_disable_expert_replication", False):
+        raise ValueError("disable_expert_replication currently requires DeepSeek-V4 or DeepSeek-V4.1")
+    optim = getattr(config, "optim", None)
+    optimizer_cfg = getattr(optim, "optimizer", None)
+    if any(
+        getattr(optimizer, "enable_hsdp_replica_dedup", False) for optimizer in getattr(optimizer_cfg, "optimizers", ())
+    ):
+        raise ValueError("disable_expert_replication is incompatible with enable_hsdp_replica_dedup")
 
 
 def set_allow_hf32(allow: bool) -> None:
@@ -93,6 +122,9 @@ class TrainerEx(Trainer):
         training: TrainingConfig = field(  # pyrefly: ignore [bad-override]
             default_factory=TrainingConfig,
         )
+        parallelism: _BaseParallelismConfig = field(
+            default_factory=ParallelismConfig,
+        )
         sdc: SDC.Config = field(default_factory=SDC.Config)
         anticipatory: AnticipatoryRoutingConfig = field(default_factory=AnticipatoryRoutingConfig)
 
@@ -123,6 +155,7 @@ class TrainerEx(Trainer):
                     self.optim.optimizer, "_cpu_offload", self.training.enable_cpu_offload
                 )
             self._post_init_optimizer()
+            _validate_expert_replication(self)
             validate_anticipatory_config(self)
             if self.sdc_replayer is not None:
                 validate_sdc_replay_config(self.sdc)
@@ -182,6 +215,7 @@ class TrainerEx(Trainer):
             raise NotImplementedError("NPU model compilation is not supported in the eager upgrade")
         if getattr(getattr(config, "optim", None), "ema", None) is not None:
             raise NotImplementedError("NPU EMA is not supported in the eager upgrade")
+        _validate_expert_replication(config)
         quantization_config = config.extension.quantization
         if quantization_config.enable_quantized_training:
             from torchtitan_npu.extensions.adaptor.torchao.converter import apply_quantization_converter
