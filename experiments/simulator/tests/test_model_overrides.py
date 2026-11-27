@@ -9,6 +9,7 @@ from dataclasses import fields, is_dataclass
 
 import pytest
 from torchtitan_simulator.cli import main
+from torchtitan_simulator.compat.torchao_capture import mx_capture_routes_to_quant_matmul
 from torchtitan_simulator.config import SimulationConfig, prepare_config
 from torchtitan_simulator.model_overrides import ModelOverrides, MoEOverrides
 
@@ -46,6 +47,8 @@ def test_empty_override_preserves_the_native_config_tree(preset):
 
 @pytest.mark.parametrize("mode", ["none", "full", "selective"])
 def test_typed_cli_geometry_reaches_quantization_loss_backward_and_optimizer(mode, tmp_path):
+    if not mx_capture_routes_to_quant_matmul():
+        pytest.skip("torchao-npu build degrades the meta-capture MX matmul to aten.mm")
     workload = main(
         [
             "--extension.quantization.enable-quantized-training",
@@ -147,6 +150,8 @@ def test_legacy_boolean_cli_alias_preserves_explicit_false(monkeypatch):
 
 @pytest.mark.parametrize("quantized", [False, True], ids=["bf16", "mxfp8"])
 def test_legacy_zero_compression_runs_as_native_window_attention(quantized):
+    if quantized and not mx_capture_routes_to_quant_matmul():
+        pytest.skip("torchao-npu build degrades the meta-capture MX matmul to aten.mm")
     from torchtitan_simulator.runner import simulate
 
     common = dict(

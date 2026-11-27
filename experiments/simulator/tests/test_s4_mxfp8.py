@@ -10,7 +10,13 @@ import torch
 from torchtitan_simulator.capture.dispatch_capture import OpDispatchCapture
 from torchtitan_simulator.capture.saved_tensors import AutogradSavedTensorCapture
 from torchtitan_simulator.cli import main
+from torchtitan_simulator.compat.torchao_capture import mx_capture_routes_to_quant_matmul
 from torchtitan_simulator.memory.estimator import estimate_static_memory
+
+pytestmark = pytest.mark.skipif(
+    not mx_capture_routes_to_quant_matmul(),
+    reason="torchao-npu build degrades the meta-capture MX matmul to aten.mm; needs a capture-compatible build",
+)
 
 
 @pytest.mark.parametrize("flag", ["--mxfp8-fqns", "--simulation.mxfp8-fqns"])

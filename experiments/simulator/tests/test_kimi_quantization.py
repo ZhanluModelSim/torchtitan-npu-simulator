@@ -6,9 +6,15 @@
 """Native MXFP8 Kimi expert capture keeps SiTU and all gradient paths."""
 
 import pytest
+from torchtitan_simulator.compat.torchao_capture import mx_capture_routes_to_quant_matmul
 from torchtitan_simulator.config import SimulationConfig
 from torchtitan_simulator.runner import simulate
 from torchtitan_simulator.validation import validate_workload
+
+pytestmark = pytest.mark.skipif(
+    not mx_capture_routes_to_quant_matmul(),
+    reason="torchao-npu build degrades the meta-capture MX matmul to aten.mm; needs a capture-compatible build",
+)
 
 
 @pytest.mark.parametrize(
