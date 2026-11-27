@@ -65,6 +65,17 @@ Chunked loss 在 F action 内执行多次 head/loss 及其反向，再通过梯�
 
 曾出现 head 的临时 reshard 策略未恢复，导致后续迭代的通信模板改变。当前作用域恢复逻辑见[chunked loss policy](chunked-loss-policy.md)；新 wrapper 或 loss 变更仍须验证策略在正常和异常路径均恢复。不能将实现泄漏直接当作 GA 本来就需要不同通信模板。
 
+## 训练 dtype：以真机 profiling 为准，不要引入 autocast 模拟
+
+真机 profiling（system3 full64 kernel dump）实测的主链执行就是 fp32：Matmul/BatchMatMul 输入输出 FLOAT，Mul/Add/ReduceSum/RealDiv 主体 FLOAT，优化器 ApplyAdamWV2 输入 FLOAT；bf16 只出现在 MoE 路径——模型代码显式 `.bfloat16()` 进 grouped GEMM、输出 `.type_as()` 回 fp32，真机侧对应大量 fp32→bf16 Cast 核。capture 按参考代码 verbatim 记账（参数 fp32、激活链 fp32、GMM bf16）与实测逐算子 dtype 一致，torchtitan 生产训练同样不依赖外层 autocast（精度靠 fsdp2 param_dtype 视图，模型自己的 fp32 router autocast 区域除外）。
+
+由此确立两条边界：
+
+- 不要给 capture forward 注入外层 bf16 autocast 区域来"对齐生产 bf16 训练"：`--training.mixed-precision-param` 的 fsdp2 视图 cast 在 Meta capture 下本来就不生效，真机主链也是 fp32，强转 bf16 会引入与实测相反的偏差。曾按此思路实现过 runner 侧 region 注入与白名单 cast，对齐实测后全部回滚。
+- Meta autocast 只保留参考代码自带的 `autocast(dtype=float32)` router 区域语义（`compat/amp.py`），区域栈取最内层；checkpoint recompute 经 unpack hook 在 autograd engine 内执行时 engine 会清空 torch function mode 栈，故 `_run_fn_with_dynamo_disabled` 处需重入激活中的投影区域，否则 recompute dtype 与 forward 保存值不一致会报 CheckpointError。
+
+排查内存口径时先核对真机 kernel 的 Input/Output Data Types 分布（fp32 与 bf16 的 kernel 时间占比、Cast 方向），再判断 capture dtype 是否可疑；"激活应随训练 dtype 减半"的直觉必须先过实测对照，looped transformer 的共享状态与 fp32 softmax 类数值必需临时在任何口径下都保留。
+
 ## 显存与卸载：不要靠删报表消除异常
 
 autograd 保存槽不等于激活卸载候选。先追踪保存、全部使用和实际释放，再决定层归属：

@@ -13,7 +13,7 @@ from weakref import WeakValueDictionary
 import torch
 
 from torchtitan_simulator import meta_env
-from torchtitan_simulator.compat.amp import install_meta_autocast
+from torchtitan_simulator.compat.amp import install_meta_autocast, install_meta_checkpoint_recompute_cast
 from torchtitan_simulator.compat.cann_metadata import install_metadata_dispatch
 from torchtitan_simulator.compat.fsdp import validate_fsdp_capture
 from torchtitan_simulator.compat.loss import install_chunked_loss_policy_restore
@@ -55,7 +55,9 @@ class RuntimeSession:
 
             install_system3_virtual_fusions(self.patches)
             self.capabilities["system3_virtual_fusions"] = (
-                "swiglu_clamp, gdn2_chunked, isa_indexer and isa_sparse_attention dispatcher Meta/autograd boundaries"
+                "swiglu_clamp, gdn2_chunked, isa_indexer, isa_sparse_attention, mhc_sinkhorn, "
+                "engram_hash and engram_gate dispatcher Meta/autograd boundaries; "
+                "native npu_rotary_mul half-mode rope"
             )
             self.capabilities["system3_engram_host_table"] = install_system3_engram_meta_support(self.patches)
         if prepared.trainer.model_spec.name == "qwen3_5":
@@ -140,6 +142,7 @@ def meta_runtime():
         capabilities = install_rotary_bridge(scope)
         capabilities["fsdp_capture_compatibility"] = fsdp_compatibility
         install_meta_autocast(scope)
+        install_meta_checkpoint_recompute_cast(scope)
         install_meta_optimizer(scope)
         install_chunked_loss_policy_restore(scope)
         previous_multithreading = torch.autograd.is_multithreading_enabled()

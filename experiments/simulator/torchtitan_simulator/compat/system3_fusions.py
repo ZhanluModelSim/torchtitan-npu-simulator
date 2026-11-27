@@ -12,8 +12,11 @@ NPU kernels; real-device calls fail explicitly.
 """
 
 import math
+import os
+import sys
 
 import torch
+import torch_npu
 
 from torchtitan_simulator.capture.tensor_semantics import (
     OperatorTensorSemantics,
@@ -276,13 +279,22 @@ isa_indexer.register_autograd(_isa_indexer_backward, setup_context=_isa_indexer_
 
 
 def _isa_attention_geometry(q, k, v, indices, bias):
+    if os.environ.get("SYSTEM3_DEBUG_ISA"):
+        print(
+            f"[isa] q={q.dtype}{tuple(q.shape)} k={k.dtype}{tuple(k.shape)} "
+            f"v={v.dtype} bias={bias.dtype}",
+            file=sys.stderr,
+        )
     if q.ndim != 4 or min(*q.shape) <= 0 or q.dtype not in _FLOAT_DTYPES:
         raise ValueError("ISA attention requires positive floating-point B/S/H/D query")
     b, s, heads, width = q.shape
     if k.ndim != 4 or k.shape[0] != b or k.shape[2:] != (heads, width) or min(k.shape) <= 0:
         raise ValueError("ISA attention key must match the query's batch, heads and width")
     if k.dtype != q.dtype:
-        raise ValueError("ISA attention key must share the query precision")
+        raise ValueError(
+            f"ISA attention key must share the query precision (q={q.dtype} {tuple(q.shape)}, "
+            f"k={k.dtype} {tuple(k.shape)}, v={getattr(v, 'dtype', None)})"
+        )
     if v.ndim != 4 or v.shape[:3] != k.shape[:3] or v.shape[-1] <= 0 or v.dtype != q.dtype:
         raise ValueError("ISA attention value must match the key's batch/grid/heads")
     if indices.dtype != torch.int64 or indices.ndim != 3 or indices.shape[:2] != (b, s):
@@ -442,10 +454,285 @@ def _register_isa_semantics() -> None:
 _register_isa_semantics()
 
 
+# ---------------------------------------------------------------------------
+# mHC: Sinkhorn doubly-stochastic projection of the branch mix matrix.  The
+# reference expands exp/clamp plus 2*n_iters elementwise normalization rounds
+# over the [Hc, Hc] mix matrix; the boundary declares that exact math (fp32
+# internal, output rounding back to the input dtype) as one capture operator
+# pair, so the backward phase sees one gradient boundary instead of the
+# ~400-op expansion.  The gradient recomputes the forward trajectory and
+# propagates the transposed normalization operators.
+# ---------------------------------------------------------------------------
+_MHC_MIX_AXES = ("branch_row", "branch_col")
+_MHC_MIX = TensorMeaning("mix_matrix", _MHC_MIX_AXES, unknown_leading_axes=True)
+_MHC_MIXED = TensorMeaning("normalized_mix", _MHC_MIX_AXES, unknown_leading_axes=True)
+
+
+@torch.library.custom_op("fused::mhc_sinkhorn", mutates_args=())
+def mhc_sinkhorn(w: torch.Tensor, n_iters: int, clamp_exp: float, clamp_denom: float) -> torch.Tensor:
+    raise RuntimeError("system3 virtual mhc_sinkhorn is available only for Meta simulation")
+
+
+@mhc_sinkhorn.register_fake
+def _mhc_sinkhorn_meta(w, n_iters, clamp_exp, clamp_denom):
+    if w.ndim < 2 or w.shape[-1] != w.shape[-2] or min(*w.shape[-2:]) <= 0:
+        raise ValueError("mhc_sinkhorn requires a positive square trailing mix matrix")
+    if w.dtype not in _FLOAT_DTYPES:
+        raise ValueError("mhc_sinkhorn requires FP16, BF16 or FP32 mix matrices")
+    if type(n_iters) is not int or n_iters < 1:
+        raise ValueError("mhc_sinkhorn requires a positive iteration count")
+    if not (clamp_exp > 0) or not math.isfinite(clamp_exp):
+        raise ValueError("mhc_sinkhorn requires a finite positive exp clamp")
+    if not (clamp_denom > 0) or not math.isfinite(clamp_denom):
+        raise ValueError("mhc_sinkhorn requires a finite positive denominator clamp")
+    return torch.empty_like(w)
+
+
+@torch.library.custom_op("fused::mhc_sinkhorn_backward", mutates_args=())
+def mhc_sinkhorn_backward(
+    w: torch.Tensor,
+    dy: torch.Tensor,
+    n_iters: int,
+    clamp_exp: float,
+    clamp_denom: float,
+) -> list[torch.Tensor]:
+    raise RuntimeError("system3 virtual mhc_sinkhorn backward is available only for Meta simulation")
+
+
+@mhc_sinkhorn_backward.register_fake
+def _mhc_sinkhorn_backward_meta(w, dy, n_iters, clamp_exp, clamp_denom):
+    if w.shape != dy.shape or dy.dtype != w.dtype:
+        raise ValueError("mhc_sinkhorn gradient must match the mix matrix's shape and precision")
+    if not (clamp_exp > 0) or not math.isfinite(clamp_exp):
+        raise ValueError("mhc_sinkhorn requires a finite positive exp clamp")
+    if not (clamp_denom > 0) or not math.isfinite(clamp_denom):
+        raise ValueError("mhc_sinkhorn requires a finite positive denominator clamp")
+    return [torch.empty_like(w)]
+
+
+def _mhc_sinkhorn_setup(ctx, inputs, output):
+    ctx.save_for_backward(inputs[0])
+    ctx.n_iters = inputs[1]
+    ctx.clamp_exp = inputs[2]
+    ctx.clamp_denom = inputs[3]
+
+
+def _mhc_sinkhorn_backward(ctx, dy):
+    (w,) = ctx.saved_tensors
+    return (
+        *mhc_sinkhorn_backward(w, dy, ctx.n_iters, ctx.clamp_exp, ctx.clamp_denom),
+        None,
+        None,
+        None,
+    )
+
+
+mhc_sinkhorn.register_autograd(_mhc_sinkhorn_backward, setup_context=_mhc_sinkhorn_setup)
+
+
+@torch.library.custom_op("fused::engram_hash", mutates_args=())
+def engram_hash(ids: torch.Tensor, multipliers: torch.Tensor, capacity: int, order: int) -> torch.Tensor:
+    raise RuntimeError("system3 virtual engram_hash is available only for Meta simulation")
+
+
+@engram_hash.register_fake
+def _engram_hash_meta(ids, multipliers, capacity, order):
+    if ids.ndim != 2 or ids.dtype != torch.int64 or min(ids.shape) <= 0:
+        raise ValueError("engram_hash requires positive [batch, sequence] int64 token ids")
+    if multipliers.ndim != 1 or multipliers.dtype != torch.int64 or multipliers.shape[0] <= 0:
+        raise ValueError("engram_hash requires a positive int64 per-head multiplier vector")
+    if type(capacity) is not int or capacity <= 0:
+        raise ValueError("engram_hash requires a positive table capacity")
+    if type(order) is not int or order < 1:
+        raise ValueError("engram_hash requires a positive n-gram order")
+    return torch.empty((*ids.shape, multipliers.shape[0]), dtype=torch.int64, device=ids.device)
+
+
+_ENGRAM_IDS_AXES = ("batch", "sequence")
+_ENGRAM_IDS = TensorMeaning("token_ids", _ENGRAM_IDS_AXES)
+_ENGRAM_MULTIPLIERS = TensorMeaning("hash_multipliers", ("engram_head",))
+_ENGRAM_KEYS = TensorMeaning("probe_keys", (*_ENGRAM_IDS_AXES, "engram_head"))
+
+
+def _register_engram_hash_semantics() -> None:
+    register_tensor_semantics(
+        str(engram_hash._opoverload),
+        OperatorTensorSemantics((("ids", _ENGRAM_IDS), ("multipliers", _ENGRAM_MULTIPLIERS)), (_ENGRAM_KEYS,)),
+    )
+
+
+@torch.library.custom_op("fused::engram_gate", mutates_args=())
+def engram_gate(
+    x: torch.Tensor,
+    table: torch.Tensor,
+    value: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    out_weight: torch.Tensor,
+    ids: torch.Tensor,
+    epsilon: float,
+    scale: float,
+) -> torch.Tensor:
+    raise RuntimeError("system3 virtual engram_gate is available only for Meta simulation")
+
+
+@engram_gate.register_fake
+def _engram_gate_meta(x, table, value, q_weight, k_weight, out_weight, ids, epsilon, scale):
+    if x.shape != table.shape or x.shape != value.shape or min(x.shape) <= 0:
+        raise ValueError("engram_gate requires matching positive projected query/key/value streams")
+    for stream in (x, table, value):
+        if stream.dtype not in _FLOAT_DTYPES:
+            raise ValueError("engram_gate requires FP16, BF16 or FP32 projected streams")
+    dim = x.shape[-1]
+    for weight in (q_weight, k_weight, out_weight):
+        if weight.shape != (dim,) or weight.dtype not in _FLOAT_DTYPES:
+            raise ValueError("engram_gate norm weights must be one floating feature weight per stream feature")
+    if ids.dtype != torch.int64 or ids.shape != x.shape[:-1]:
+        raise ValueError("engram_gate requires int64 token ids matching the stream's token axes")
+    if not (epsilon > 0) or not math.isfinite(epsilon):
+        raise ValueError("engram_gate requires a finite positive norm epsilon")
+    if not (scale > 0) or not math.isfinite(scale):
+        raise ValueError("engram_gate requires a finite positive dot-product scale")
+    # The reference gate math promotes the scaled dot and the gated product to
+    # the widest stream precision (fp32 host table vs bf16 stream).
+    promoted = torch.promote_types(x.dtype, torch.promote_types(table.dtype, value.dtype))
+    return torch.empty(x.shape, dtype=promoted, device=x.device)
+
+
+@torch.library.custom_op("fused::engram_gate_backward", mutates_args=())
+def engram_gate_backward(
+    x: torch.Tensor,
+    table: torch.Tensor,
+    value: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    out_weight: torch.Tensor,
+    ids: torch.Tensor,
+    dy: torch.Tensor,
+    epsilon: float,
+    scale: float,
+) -> list[torch.Tensor]:
+    raise RuntimeError("system3 virtual engram_gate backward is available only for Meta simulation")
+
+
+@engram_gate_backward.register_fake
+def _engram_gate_backward_meta(x, table, value, q_weight, k_weight, out_weight, ids, dy, epsilon, scale):
+    promoted = torch.promote_types(x.dtype, torch.promote_types(table.dtype, value.dtype))
+    if dy.shape != x.shape or dy.dtype != promoted:
+        raise ValueError("engram_gate gradient must match the gated output's shape and precision")
+    return [
+        torch.empty_like(x),
+        torch.empty_like(table),
+        torch.empty_like(value),
+        torch.empty_like(q_weight),
+        torch.empty_like(k_weight),
+        torch.empty_like(out_weight),
+    ]
+
+
+def _engram_gate_setup(ctx, inputs, output):
+    ctx.save_for_backward(*inputs[:7])
+    ctx.epsilon = inputs[7]
+    ctx.scale = inputs[8]
+
+
+def _engram_gate_backward(ctx, dy):
+    return (
+        *engram_gate_backward(*ctx.saved_tensors, dy, ctx.epsilon, ctx.scale),
+        None,
+        None,
+        None,
+    )
+
+
+engram_gate.register_autograd(_engram_gate_backward, setup_context=_engram_gate_setup)
+
+
+_ENGRAM_STREAM_AXES = ("feature",)
+_ENGRAM_STREAM = TensorMeaning("gate_stream", _ENGRAM_STREAM_AXES, unknown_leading_axes=True)
+_ENGRAM_PROJECTED_KEY_QUERY = TensorMeaning("projected_key_query", _ENGRAM_STREAM_AXES, unknown_leading_axes=True)
+_ENGRAM_PROJECTED_VALUE = TensorMeaning("projected_value", _ENGRAM_STREAM_AXES, unknown_leading_axes=True)
+_ENGRAM_NORM_WEIGHT = TensorMeaning("norm_weight", _ENGRAM_STREAM_AXES)
+_ENGRAM_GATED_OUTPUT = TensorMeaning("gated_output", _ENGRAM_STREAM_AXES, unknown_leading_axes=True)
+_ENGRAM_STREAM_GRADIENT = TensorMeaning("gate_stream_gradient", _ENGRAM_STREAM_AXES, unknown_leading_axes=True)
+_ENGRAM_KEY_QUERY_GRADIENT = TensorMeaning(
+    "projected_key_query_gradient", _ENGRAM_STREAM_AXES, unknown_leading_axes=True
+)
+_ENGRAM_VALUE_GRADIENT = TensorMeaning("projected_value_gradient", _ENGRAM_STREAM_AXES, unknown_leading_axes=True)
+_ENGRAM_NORM_WEIGHT_GRADIENT = TensorMeaning("norm_weight_gradient", _ENGRAM_STREAM_AXES)
+
+
+def _register_engram_gate_semantics() -> None:
+    register_tensor_semantics(
+        str(engram_gate._opoverload),
+        OperatorTensorSemantics(
+            (
+                ("x", _ENGRAM_STREAM),
+                ("table", _ENGRAM_PROJECTED_KEY_QUERY),
+                ("value", _ENGRAM_PROJECTED_VALUE),
+                ("q_weight", _ENGRAM_NORM_WEIGHT),
+                ("k_weight", _ENGRAM_NORM_WEIGHT),
+                ("out_weight", _ENGRAM_NORM_WEIGHT),
+                ("ids", _ENGRAM_IDS),
+            ),
+            (_ENGRAM_GATED_OUTPUT,),
+        ),
+    )
+    register_tensor_semantics(
+        str(engram_gate_backward._opoverload),
+        OperatorTensorSemantics(
+            (
+                ("x", _ENGRAM_STREAM),
+                ("table", _ENGRAM_PROJECTED_KEY_QUERY),
+                ("value", _ENGRAM_PROJECTED_VALUE),
+                ("q_weight", _ENGRAM_NORM_WEIGHT),
+                ("k_weight", _ENGRAM_NORM_WEIGHT),
+                ("out_weight", _ENGRAM_NORM_WEIGHT),
+                ("ids", _ENGRAM_IDS),
+                ("dy", _ENGRAM_GATED_OUTPUT),
+            ),
+            (
+                _ENGRAM_STREAM_GRADIENT,
+                _ENGRAM_KEY_QUERY_GRADIENT,
+                _ENGRAM_VALUE_GRADIENT,
+                _ENGRAM_NORM_WEIGHT_GRADIENT,
+                _ENGRAM_NORM_WEIGHT_GRADIENT,
+                _ENGRAM_NORM_WEIGHT_GRADIENT,
+            ),
+        ),
+    )
+
+
+_register_engram_hash_semantics()
+_register_engram_gate_semantics()
+
+
+def _register_mhc_semantics() -> None:
+    register_tensor_semantics(
+        str(mhc_sinkhorn._opoverload), OperatorTensorSemantics((("w", _MHC_MIX),), (_MHC_MIXED,))
+    )
+    output_gradient = TensorMeaning("output_gradient", _MHC_MIX.axes, _MHC_MIX.unknown_leading_axes)
+    mix_gradient = TensorMeaning("mix_matrix_gradient", _MHC_MIX.axes, _MHC_MIX.unknown_leading_axes)
+    register_tensor_semantics(
+        str(mhc_sinkhorn_backward._opoverload),
+        OperatorTensorSemantics((("w", _MHC_MIX), ("dy", output_gradient)), (mix_gradient,)),
+    )
+
+
+_register_mhc_semantics()
+
+
 def install_system3_virtual_fusions(scope):
     """Replace the model-level fusion call sites with the virtual boundaries."""
     import torchtitan_npu.models.system3.model as system3_model
-    from torchtitan_npu.models.system3.model import GDN2Attention, IndexedSparseAttention, ISAIndexer
+    from torchtitan_npu.models.system3.model import (
+        EngramModule,
+        GDN2Attention,
+        IndexedSparseAttention,
+        ISAIndexer,
+        PolynomialRollingHash,
+        SinkhornIteration,
+    )
 
     def activation(x, gate, clamp_val=None):
         return swiglu_clamp(x, gate, clamp_val)
@@ -470,7 +757,50 @@ def install_system3_virtual_fusions(scope):
         )
         return out
 
+    def sinkhorn_projection(module, w):
+        return mhc_sinkhorn(w, module.n_iters, 20.0, 1e-12)
+
+    def ngram_hash(module, input_ids):
+        # The reference Horner recurrence (h = (h*BASE + id*mult) % capacity,
+        # per-head multipliers, order-window shifts) as one integer-mix
+        # boundary matching the inference engram hash family.
+        return engram_hash(input_ids, module.multipliers, module.capacity, module.order)
+
+    def engram_gate_fusion(module, x_proj, table_proj, value_proj, input_ids):
+        # The reference rmsnorm_ssr gate segment: per-stream float32 RMSNorm,
+        # scaled query/key dot, signed-square-root sigmoid gate, static
+        # id != 0 token mask, gated value stream. Matches the inference
+        # projected_rms_ssr engram gate family (projections stay eager).
+        return engram_gate(
+            x_proj,
+            table_proj,
+            value_proj,
+            module.q_norm.weight,
+            module.k_norm.weight,
+            module.output_norm.weight,
+            input_ids,
+            module.q_norm.eps,
+            module.scale,
+        )
+
+    def rotary_fusion(q, cos, sin):
+        # The eager half-split rotation (rotate_half: chunk into halves,
+        # swap with sign) is npu_rotary_mul's native "half" mode: one
+        # factor element per rotated pair. The reference cache concatenates
+        # the pair factors twice (front == back), so slicing the front half
+        # is numerically identical; reshape to the activation's rank for the
+        # [B, S, H, D] broadcast. The reference casts the fp32 cache to the
+        # stream dtype before the elementwise product; the bridge keeps it.
+        half = q.shape[-1] // 2
+        cos_b = cos[..., :half].to(q.dtype).reshape(1, cos.shape[0], 1, half)
+        sin_b = sin[..., :half].to(q.dtype).reshape(1, sin.shape[0], 1, half)
+        return torch_npu.npu_rotary_mul(q, cos_b, sin_b, rotary_mode="half")
+
     scope.replace(system3_model, "swiglu", activation)
+    scope.replace(system3_model, "apply_rotary_to_q", rotary_fusion)
     scope.replace(GDN2Attention, "_delta_rule_scan", scan)
     scope.replace(ISAIndexer, "_select_topk", indexer_topk)
     scope.replace(IndexedSparseAttention, "_sparse_attention", selected_attention)
+    scope.replace(SinkhornIteration, "forward", sinkhorn_projection)
+    scope.replace(PolynomialRollingHash, "forward", ngram_hash)
+    scope.replace(EngramModule, "_gate", engram_gate_fusion)

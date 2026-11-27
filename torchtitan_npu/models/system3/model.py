@@ -1570,13 +1570,30 @@ class EngramModule(Module):
         # rmsnorm_ssr static gate: RMSNorm dot -> signed sqrt -> sigmoid ->
         # static token mask (positions without a token id, id == 0, inject
         # no memory).
-        q = self.q_norm(self.query_proj(self.input_norm(hidden_states)))
-        k = self.k_norm(self.key_proj(mem))
+        x_proj = self.query_proj(self.input_norm(hidden_states))
+        return self._gate(
+            x_proj, self.key_proj(mem), self.value_proj(mem), input_ids
+        ).to(hidden_states.dtype)
+
+    def _gate(self, x_proj, table_proj, value_proj, input_ids):
+        """rmsnorm_ssr static gate over the projected engram streams.
+
+        ``x_proj``/``table_proj``/``value_proj`` are the pre-norm projected
+        query/key/value streams; returns the unrounded gated value stream in
+        the projected-stream dtype. The fused capture boundary replaces this
+        method wholesale with the same math (fp32-internal gate math, result
+        rounded back to the stream dtype by the caller).
+        """
+        q = self.q_norm(x_proj)
+        k = self.k_norm(table_proj)
         dot = (q * k).sum(dim=-1, keepdim=True) * self.scale
         gate = torch.sigmoid(dot.sign() * dot.abs().sqrt())
         gate = gate * (input_ids != 0).unsqueeze(-1).to(gate.dtype)
 
-        out = self.output_norm(self.value_proj(mem))
+        out = self.output_norm(value_proj)
+        # V4.1 engram convention: the fp32 host-resident table and the gate
+        # math stay fp32-internal; the caller rounds the product back to the
+        # stream dtype so the lookup does not promote the residual chain.
         return gate * out
 
 
@@ -1651,8 +1668,11 @@ class HyperConnectionBlock(Module):
         mix = self.sinkhorn(self.mix_weights)
         # Eager einsum would promote the bf16 activations with the fp32 mix
         # matrix to fp32 math; state the promotion explicitly so the Meta
-        # capture sees one dtype.
-        mixed = torch.einsum("bshd,ho->bsod", expanded.float(), mix.float())
+        # capture sees one dtype. Like the V4.1 fused HcPre (fp32-internal
+        # math, ``.to(x.dtype)`` return), the fp32 accumulation is kept but
+        # the result rounds back to the stream dtype so the residual chain
+        # stays bf16 under the fsdp2 param_dtype view.
+        mixed = torch.einsum("bshd,ho->bsod", expanded.float(), mix.float()).to(x.dtype)
         merged = mixed.reshape(b, s, self.hc_mult * self.branch_dim)
         return residual + self.post_norm(self.contract(merged))
 
@@ -2005,6 +2025,12 @@ class ModalityEncoder(Module):
 
     def encode(self, modality: str, x) -> torch.Tensor:
         """Returns [b, L_m, hidden_size] for one modality segment."""
+        # Raw modality payloads arrive as fp32 data; without a cast they would
+        # promote the whole encoder chain (and then the segment concat) to
+        # fp32, defeating the fsdp2 bf16 param view. Cast at the entry to the
+        # projection weight dtype (bf16 under the param_dtype view, fp32 in
+        # pure-fp32 runs); encoders keep fp32-internal/cast-back math.
+        x = x.to(self.modality_projs[modality].weight.dtype)
         if modality == "image":
             z = self.image_encoder(x)  # pyrefly: ignore [missing-attribute]
         elif modality == "audio":

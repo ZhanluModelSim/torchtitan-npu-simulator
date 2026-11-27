@@ -30,6 +30,7 @@ import torch
 from torch.distributed._functional_collectives import all_reduce, all_to_all_single
 from torch.profiler import record_function
 
+from torchtitan_simulator.capture.collective_facts import collective_fact_scope
 from torchtitan_simulator.capture.dispatch_capture import (
     annotate_active_capture_events,
     host_only_work,
@@ -42,10 +43,52 @@ from torchtitan_simulator.capture.tensor_semantics import (
 )
 
 
-# The fused SparseAdam boundary (registration, fake and tensor semantics) is
-# declared once in compat.deepseek_v4_1 and reused here so every model shares
-# one capture name.
-from torchtitan_simulator.compat.deepseek_v4_1 import sparse_adam_update  # noqa: E402
+@torch.library.custom_op("fused::sparse_adam_update", mutates_args=("parameter", "exp_avg", "exp_avg_sq"))
+def sparse_adam_update(
+    parameter: torch.Tensor,
+    grad_indices: torch.Tensor,
+    grad_values: torch.Tensor,
+    exp_avg: torch.Tensor,
+    exp_avg_sq: torch.Tensor,
+    step: int,
+    lr: float,
+    beta1: float,
+    beta2: float,
+    eps: float,
+) -> None:
+    """Virtual boundary of one native SparseAdam table update.
+
+    The native functional coalesces the sparse gradient and masks the moments
+    through SparseMeta kernels that do not exist, so the simulator records the
+    update at this declared boundary instead: the same parameter selection,
+    state materialization and per-table work as production, executed only in
+    Meta capture. The sparse gradient enters as its dense index/value rows.
+    """
+    raise RuntimeError("system3 virtual SparseAdam update is available only for Meta simulation")
+
+
+@sparse_adam_update.register_fake
+def _sparse_adam_update_meta(parameter, grad_indices, grad_values, exp_avg, exp_avg_sq, step, lr, beta1, beta2, eps):
+    return None
+
+
+register_tensor_semantics(
+    "fused.sparse_adam_update.default",
+    OperatorTensorSemantics(
+        inputs=(
+            ("parameter", TensorMeaning("host_table_weight", ("table_row", "embedding_dim"))),
+            ("grad_indices", TensorMeaning("host_sparse_gradient_row_ids", ("sparse_dim", "sparse_entry"))),
+            ("grad_values", TensorMeaning("host_sparse_gradient_values", ("sparse_entry", "embedding_dim"))),
+            ("exp_avg", TensorMeaning("first_moment", ("table_row", "embedding_dim"))),
+            ("exp_avg_sq", TensorMeaning("second_moment", ("table_row", "embedding_dim"))),
+        ),
+        outputs=(
+            TensorMeaning("host_table_weight", ("table_row", "embedding_dim")),
+            TensorMeaning("first_moment", ("table_row", "embedding_dim")),
+            TensorMeaning("second_moment", ("table_row", "embedding_dim")),
+        ),
+    ),
+)
 
 
 def _meta_accumulate_sparse_gradient(self, local_row_ids: torch.Tensor, grad_rows: torch.Tensor) -> None:
@@ -358,6 +401,42 @@ def _meta_container_clip_grad_norm(self, parameters, max_norm, **kwargs):
 # ---------------------------------------------------------------------------
 
 
+def _lookup_exchange_facts(mesh, tensor, *, tokens, top_k):
+    """Producer-proven geometry for the Engram lookup exchanges.
+
+    The twin exchanges force-balanced buckets of identical per-rank payload
+    shapes: every rank pushes the same token volume through the same balanced
+    split layout and reads back the same volume. The rows use a symmetric
+    round-robin rotation of the balanced bucket sizes, anchored so the
+    capture-rank row matches the native split lists the exchange passes;
+    every row and every column sums to the same per-rank payload for any
+    token distribution, including non-divisible counts.
+    """
+    from torchtitan_simulator.capture.comm_events import _resolve_comm_ranks
+
+    groups = _resolve_comm_ranks(mesh)
+    if len(groups) != 1:
+        return None
+    size = len(groups[0])
+    local = mesh.get_local_rank()
+    quotient, remainder = divmod(int(tokens) * int(top_k), size)
+    rows = tuple(
+        tuple(
+            quotient + (1 if (rank - local + peer) % size < remainder else 0)
+            for peer in range(size)
+        )
+        for rank in range(size)
+    )
+    shapes = (tuple(int(d) for d in tensor.shape),) * size
+    return {
+        "source": "torchtitan_engram_balanced_lookup_exchange_v1",
+        "send_rows": rows,
+        "recv_rows": tuple(zip(*rows, strict=True)),
+        "rank_input_shapes": shapes,
+        "rank_output_shapes": shapes,
+    }
+
+
 def _balanced_ep_lookup_rows(ctx, weight, row_ids, mesh):
     """Meta decomposition of the routed lookup with balanced split geometry.
 
@@ -378,15 +457,24 @@ def _balanced_ep_lookup_rows(ctx, weight, row_ids, mesh):
     splits = [quotient + int(rank < remainder) for rank in range(ep_size)]
 
     counts = torch.zeros(ep_size, dtype=torch.int64, device=device)
-    all_to_all_single(counts, None, None, mesh)
-    received_ids = all_to_all_single(flat.contiguous(), splits, splits, mesh)
+    with collective_fact_scope(
+        _lookup_exchange_facts(mesh, counts, tokens=1, top_k=ep_size)
+    ):
+        all_to_all_single(counts, None, None, mesh)
+    with collective_fact_scope(
+        _lookup_exchange_facts(mesh, flat, tokens=total, top_k=1)
+    ):
+        received_ids = all_to_all_single(flat.contiguous(), splits, splits, mesh)
     rows_owner_host = torch.empty(
         (received_ids.shape[0], row_dim),
         dtype=weight.dtype,
         device="cpu",
     )
     rows_owner = rows_owner_host.to(device=device)
-    rows = all_to_all_single(rows_owner, splits, splits, mesh)
+    with collective_fact_scope(
+        _lookup_exchange_facts(mesh, rows_owner, tokens=total, top_k=1)
+    ):
+        rows = all_to_all_single(rows_owner, splits, splits, mesh)
 
     # The single logical rank of a capture sends each request to its balanced
     # bucket and reads it back from the same bucket, so the inverse is the
@@ -417,12 +505,15 @@ def _balanced_ep_lookup_grad_rows(ctx, grad_output: torch.Tensor):
         device=grad_output.device,
     )
     grad_unique.index_add_(0, inverse, grad_output.reshape(-1, row_dim).float())
-    received_grads = all_to_all_single(
-        grad_unique.contiguous(),
-        ctx.recv_splits,
-        ctx.send_splits,
-        ctx.mesh,
-    )
+    with collective_fact_scope(
+        _lookup_exchange_facts(ctx.mesh, grad_unique, tokens=grad_unique.shape[0], top_k=1)
+    ):
+        received_grads = all_to_all_single(
+            grad_unique.contiguous(),
+            ctx.recv_splits,
+            ctx.send_splits,
+            ctx.mesh,
+        )
     return received_grads, received_ids
 
 

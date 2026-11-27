@@ -281,6 +281,82 @@ def _classify_output(event: RawMemoryEvent, comm_by_op: dict[int, Any]) -> tuple
     return "op_output", "producer"
 
 
+def _correct_loop_shared_gradient_residency(
+    events: list[RawMemoryEvent],
+    lifetimes_by_tensor_id: dict[int, TensorLifetime],
+    resolve_root,
+    notes: list[str],
+) -> None:
+    """Anchor cross-cycle residency of loop-shared-parameter gradients.
+
+    A loop (weight-shared) model runs the same modules twice per step, so each
+    shared parameter produces one full gradient per cycle. Real FSDP2 reduces
+    each gradient at its own post-backward hook (per-cycle reduce-scatter;
+    verified by probing ``FSDPParamGroup.post_backward`` on gloo: two triggers
+    per shared unit, with and without activation checkpointing). The capture
+    environment merges those per-cycle reductions into the late accumulation
+    add, so the observed storage release pins every earlier cycle's full
+    gradient until the last cycle's backward runs, inflating backward peak by
+    up to one extra full-gradient set per shared parameter.
+
+    Signature: a backward-phase ``aten.add.*`` whose gradient inputs are two or
+    more identical-shape backward-produced gradients whose only other consumers
+    are alias/view events (transpose/view of the same storage, e.g. the
+    post-grouped_mm gradient layout transpose). Each earlier cycle gradient is
+    re-anchored to the next accumulation group's same-cycle gradient birth (its
+    own cycle's reduction point). Non-loop models never match (every gradient
+    has exactly one consumer add), so their lifetimes are untouched;
+    gradient-accumulation matches the signature too, and per-cycle reduction is
+    likewise the real FSDP2 semantics there.
+    """
+    alias_ops = {event.op_id for event in events if is_alias_event(event)}
+    matches: list[list[TensorLifetime]] = []
+    for event in events:
+        if event.phase != "backward" or not event.raw_op_type.startswith("aten.add."):
+            continue
+        candidates: dict[tuple[int, ...], list[TensorLifetime]] = defaultdict(list)
+        for ref in event.inputs:
+            lifetime = lifetimes_by_tensor_id.get(resolve_root(ref))
+            if lifetime is None or lifetime.num_bytes <= 0 or not lifetime.shape:
+                continue
+            if lifetime.producer_phase != "backward" or lifetime.kind != "op_output":
+                continue
+            consumers = set(lifetime.consumer_ops)
+            if not consumers or not consumers <= (alias_ops | {event.op_id}):
+                continue
+            candidates[lifetime.shape].append(lifetime)
+        for group in candidates.values():
+            if len(group) < 2:
+                continue
+            group.sort(key=lambda item: item.birth_seq)
+            matches.append(group)
+    if not matches:
+        return
+    matches.sort(key=lambda group: group[-1].birth_seq)
+    corrected = 0
+    for index, group in enumerate(matches):
+        for position, early in enumerate(group[:-1]):
+            if index + 1 < len(matches) and position < len(matches[index + 1]):
+                anchor = matches[index + 1][position].birth_seq
+            else:
+                anchor = group[position + 1].birth_seq
+            death = min(early.death_seq, max(anchor, early.birth_seq))
+            if death >= early.death_seq:
+                continue
+            early.death_seq = death
+            early.consumer_ops = []
+            early.consumer_seqs = []
+            early.consumer_phases = []
+            early.reason = "loop_shared_gradient_cycle_release"
+            corrected += 1
+    notes.append(
+        f"Loop-shared gradient correction: {corrected} earlier-cycle gradients in {len(matches)} shared-parameter "
+        "accumulation groups were re-anchored to their own cycle's reduction point. The capture merged per-cycle "
+        "FSDP post-backward reductions into one late accumulation add, pinning earlier cycle gradients until the "
+        "last cycle; real FSDP2 reduces each cycle's gradient at its own post-backward hook."
+    )
+
+
 def _finalize_kind(lifetime: TensorLifetime) -> None:
     if lifetime.kind in {
         "parameter_shard",
@@ -619,6 +695,7 @@ def estimate_static_memory(
         if death < max([lifetime.birth_seq, *lifetime.consumer_seqs]):
             raise ValueError("Observed storage release precedes a captured producer/consumer")
         lifetime.death_seq = death
+    _correct_loop_shared_gradient_residency(events, lifetimes_by_tensor_id, storage_root, notes)
     for lifetime in (*param_lifetimes, *buffer_lifetimes):
         lifetime.death_seq = capture_end
     if observed_storages:

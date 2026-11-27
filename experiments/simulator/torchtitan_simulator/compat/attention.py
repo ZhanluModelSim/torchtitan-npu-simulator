@@ -247,11 +247,18 @@ class _NpuFusionAttentionMetaAutograd(torch.autograd.Function):
     def forward(ctx, query, key, value, head_num, scale, original):
         # Call the raw op, not the torch_npu wrapper: the wrapper queries the
         # device count, which fails in device-less Meta containers. The Meta
-        # kernels registered above make this dispatch pure.
-        result = torch.ops.npu.npu_fusion_attention.default(
-            query, key, value, head_num, "BSND", scale=scale, keep_prob=1.0, sparse_mode=0
-        )
-        output, softmax_max, softmax_sum, softmax_in = result[0], result[1], result[2], result[3]
+        # kernels registered above make this dispatch pure; when registration
+        # was refused (newer torch_npu ships a device-touching python Meta
+        # kernel), the shape-level helper carries the same contract directly.
+        if _NPU_FA_META_LIBRARY is None:
+            output, softmax_max, softmax_sum, softmax_in, _, _, _ = _npu_fusion_attention_meta(
+                query, key, value, head_num, "BSND", scale=scale, keep_prob=1.0, sparse_mode=0
+            )
+        else:
+            result = torch.ops.npu.npu_fusion_attention.default(
+                query, key, value, head_num, "BSND", scale=scale, keep_prob=1.0, sparse_mode=0
+            )
+            output, softmax_max, softmax_sum, softmax_in = result[0], result[1], result[2], result[3]
         ctx.save_for_backward(query, key, value, softmax_max, softmax_sum, softmax_in)
         ctx.head_num = head_num
         ctx.scale = scale
@@ -261,19 +268,34 @@ class _NpuFusionAttentionMetaAutograd(torch.autograd.Function):
     # pyrefly: ignore [bad-override]
     def backward(ctx, dy):
         query, key, value, softmax_max, softmax_sum, softmax_in = ctx.saved_tensors
-        gradients = torch.ops.npu.npu_fusion_attention_grad.default(
-            query,
-            key,
-            value,
-            dy,
-            ctx.head_num,
-            "BSND",
-            scale_value=ctx.scale,
-            softmax_max=softmax_max if softmax_max.numel() else None,
-            softmax_sum=softmax_sum if softmax_sum.numel() else None,
-            softmax_in=softmax_in if softmax_in.numel() else None,
-            sparse_mode=0,
-        )
+        if _NPU_FA_META_LIBRARY is None:
+            gradients = _npu_fusion_attention_grad_meta(
+                query,
+                key,
+                value,
+                dy,
+                ctx.head_num,
+                "BSND",
+                scale_value=ctx.scale,
+                softmax_max=softmax_max if softmax_max.numel() else None,
+                softmax_sum=softmax_sum if softmax_sum.numel() else None,
+                softmax_in=softmax_in if softmax_in.numel() else None,
+                sparse_mode=0,
+            )
+        else:
+            gradients = torch.ops.npu.npu_fusion_attention_grad.default(
+                query,
+                key,
+                value,
+                dy,
+                ctx.head_num,
+                "BSND",
+                scale_value=ctx.scale,
+                softmax_max=softmax_max if softmax_max.numel() else None,
+                softmax_sum=softmax_sum if softmax_sum.numel() else None,
+                softmax_in=softmax_in if softmax_in.numel() else None,
+                sparse_mode=0,
+            )
         return gradients[0], gradients[1], gradients[2], None, None, None
 
 
@@ -308,9 +330,16 @@ def install_npu_fusion_attention_autograd(scope):
     # deregisters its impls and the vendor device-touching Meta kernel
     # would win the dispatch again.
     global _NPU_FA_META_LIBRARY
-    _NPU_FA_META_LIBRARY = torch.library.Library("npu", "FRAGMENT")
-    _NPU_FA_META_LIBRARY.impl("npu_fusion_attention", _npu_fusion_attention_meta, "Meta")
-    _NPU_FA_META_LIBRARY.impl("npu_fusion_attention_grad", _npu_fusion_attention_grad_meta, "Meta")
+    try:
+        _NPU_FA_META_LIBRARY = torch.library.Library("npu", "FRAGMENT")
+        _NPU_FA_META_LIBRARY.impl("npu_fusion_attention", _npu_fusion_attention_meta, "Meta")
+        _NPU_FA_META_LIBRARY.impl("npu_fusion_attention_grad", _npu_fusion_attention_grad_meta, "Meta")
+    except RuntimeError:
+        # Newer torch_npu ships its own python Meta kernel for these ops; that
+        # kernel touches the device manager (it fails without hardware) and
+        # blocks re-registration.  The seam below then carries the whole Meta
+        # path by calling the shape-level helpers directly, without dispatch.
+        _NPU_FA_META_LIBRARY = None
 
     seam = fusion_attention._encoder_fusion_attention
 
