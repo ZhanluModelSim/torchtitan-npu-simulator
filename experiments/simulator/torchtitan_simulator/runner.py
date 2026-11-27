@@ -245,6 +245,9 @@ def _simulate(simulation, timings: HostTimings):
                     uniform_geometry_source="simulator_uniform_synthetic_spmd_v1",
                 )
             )
+            from torchtitan_simulator.compat.routing import install_head_parallel_facts
+
+            runtime.capabilities.update(install_head_parallel_facts(runtime.patches, model))
             loss_fn = config.loss.build(compile_config=config.compile)
             loss_fn.set_lm_head(model.lm_head)
             model._skip_lm_head = True

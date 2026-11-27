@@ -70,6 +70,26 @@ from torch.distributed.tensor import DeviceMesh, DTensor
 from .model import MultiHeadMoE
 
 
+def static_balanced_expert_ids(
+    tokens_all: int, head_local: int, k_per_head: int, experts_per_head: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Deterministic load-balanced routing ids for the debug HP flavor.
+
+    ``forward`` and the simulator's capture facts must agree on the exact
+    pattern, so both call this helper (forward on the live device, capture
+    on CPU) instead of restating the arithmetic. Returns the in-head expert
+    index and the local-pool expert id per (token, head, slot).
+    """
+    indices_TSK = (
+        torch.arange(tokens_all * head_local * k_per_head, device=device, dtype=torch.int64).reshape(
+            tokens_all, head_local, k_per_head
+        )
+        % experts_per_head
+    )
+    head_offset = torch.arange(head_local, device=device, dtype=torch.int64) * experts_per_head
+    return indices_TSK, indices_TSK + head_offset.view(1, -1, 1)
+
+
 def head_dispatch(x_HTS: torch.Tensor, ep_mesh: DeviceMesh, head_local: int) -> torch.Tensor:
     """Transpose ``[Hm, T_local, hs]`` (token-owned, all heads) to
     ``[T_all, head_local, hs]`` (head-owned, all tokens in the ep group).
@@ -233,23 +253,20 @@ class HeadParallelMultiHeadMoE(MultiHeadMoE):
         logits = torch.einsum("tsh,she->tse", x_TSH, router)
         scores = F.softmax(logits, dim=-1)
         if self.router._debug_force_load_balance:
-            ids = (
-                torch.arange(tokens_all * head_local_ * k_per_head, device=scores.device, dtype=torch.int64).reshape(
-                    tokens_all, head_local_, k_per_head
-                )
-                % experts_per_head
+            indices_TSK, expert_ids_TSK = static_balanced_expert_ids(
+                tokens_all, head_local_, k_per_head, experts_per_head, scores.device
             )
-            weights_TSK = scores.gather(dim=-1, index=ids)
-            indices_TSK = ids
+            weights_TSK = scores.gather(dim=-1, index=indices_TSK)
         else:
             weights_TSK, indices_TSK = torch.topk(scores, k=k_per_head, dim=-1)
+            # Local expert id space: the grouped experts see their local
+            # weight shard (E_local = E_total/ep, matching
+            # ``w1_EFD.to_local()``), so the grouped-mm offsets span the
+            # local pool only. Owned head s_local maps to local expert
+            # s_local*Es + idx.
+            head_offset = torch.arange(head_local, device=x_TSH.device, dtype=torch.int64) * experts_per_head
+            expert_ids_TSK = indices_TSK + head_offset.view(1, -1, 1)
 
-        # Local expert id space: the grouped experts see their local weight
-        # shard (E_local = E_total/ep, matching ``w1_EFD.to_local()``), so
-        # the grouped-mm offsets span the local pool only. Owned head
-        # s_local maps to local expert s_local*Es + idx.
-        head_offset = torch.arange(head_local, device=x_TSH.device, dtype=torch.int64) * experts_per_head
-        expert_ids_TSK = indices_TSK + head_offset.view(1, -1, 1)
         routing_map_TSE = torch.zeros(
             tokens_all,
             head_local,

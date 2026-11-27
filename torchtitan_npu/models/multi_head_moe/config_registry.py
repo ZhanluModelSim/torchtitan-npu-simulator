@@ -205,6 +205,53 @@ class _Geometry:
     max_seq_len: int = 4096
 
 
+def _production_model_config() -> MultiHeadMoEModel.Config:
+    """Published 2.5T preview geometry, field-for-field from the pristine
+    reference ``ModelArgs`` (``_mhoe_scratch/multi-head_moe_ORIGINAL.py``):
+    dim=8192 / 80 layers / 64 heads x 128 hd / dense 16384, MoE 32 heads x
+    896 experts-per-head (28672 routed experts total) x K=16 with
+    384x4=1536-wide experts, shared 4096, SLA2 block 64 with the 0.5% / 0.1%
+    top-k ratios, 5M context bound, vocab 102400.
+    """
+    attn_kwargs = dict(
+        dim=8192,
+        n_heads=64,
+        head_dim=128,
+        block_size=64,
+        norm_eps=1e-6,
+        rope_theta=10000.0,
+        max_seq_len=5_000_000,
+        sla2_topk_ratio_1m=0.005,
+        sla2_topk_ratio_5m=0.001,
+        router_proj_dim=64,
+        temp=0.1,
+    )
+    moe_kwargs = dict(
+        dim=8192,
+        moe_heads=32,
+        head_hidden=384,
+        experts_per_head=896,
+        k_per_head=16,
+        expert_inter_mult=4,
+        shared_inter_dim=4096,
+    )
+    return _make_model_config(
+        n_layers=80,
+        dim=8192,
+        vocab_size=102400,
+        inter_dim=16384,
+        norm_eps=1e-6,
+        moe_kwargs=moe_kwargs,
+        attn_kwargs=attn_kwargs,
+    )
+
+
+def _production_head_parallel_model_config() -> MultiHeadMoEModel.Config:
+    config = _production_model_config()
+    config.head_parallel = True
+    return config
+
+
 def _make_model_config(
     *,
     n_layers: int,
@@ -283,6 +330,8 @@ def _debugmodel_head_parallel_model_config() -> MultiHeadMoEModel.Config:
 multi_head_moe_configs = {
     "debugmodel": _debugmodel_model_config,
     "debugmodel-head-parallel": _debugmodel_head_parallel_model_config,
+    "2p5t": _production_model_config,
+    "2p5t-head-parallel": _production_head_parallel_model_config,
 }
 
 
@@ -356,6 +405,74 @@ def multi_head_moe_debugmodel_head_parallel() -> Trainer.Config:
         training=TrainingConfig(
             local_batch_size=1,
             seq_len=128,
+            steps=10,
+        ),
+        dataloader=HuggingFaceTextDataLoader.Config(
+            dataset="c4_test",
+        ),
+        metrics=MetricsProcessor.Config(log_freq=1),
+        checkpoint=CheckpointManager.Config(
+            interval=10,
+            last_save_model_only=False,
+        ),
+        activation_checkpoint=FullAC.Config(),
+    )
+
+
+def multi_head_moe_2p5t() -> Trainer.Config:
+    model_spec = model_registry("2p5t")
+    return Trainer.Config(
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(
+                global_vocab_size=decoder_vocab_size(model_spec),
+            ),
+        ),
+        hf_assets_path="./tests/assets/tokenizer",
+        model_spec=model_spec,
+        optimizer=default_adamw(lr=8e-4),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=2,
+            decay_ratio=0.8,
+            decay_type="linear",
+            min_lr_factor=0.0,
+        ),
+        training=TrainingConfig(
+            local_batch_size=1,
+            seq_len=4096,
+            steps=10,
+        ),
+        dataloader=HuggingFaceTextDataLoader.Config(
+            dataset="c4_test",
+        ),
+        metrics=MetricsProcessor.Config(log_freq=1),
+        checkpoint=CheckpointManager.Config(
+            interval=10,
+            last_save_model_only=False,
+        ),
+        activation_checkpoint=FullAC.Config(),
+    )
+
+
+def multi_head_moe_2p5t_head_parallel() -> Trainer.Config:
+    model_spec = model_registry("2p5t-head-parallel")
+    return Trainer.Config(
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(
+                global_vocab_size=decoder_vocab_size(model_spec),
+            ),
+        ),
+        hf_assets_path="./tests/assets/tokenizer",
+        model_spec=model_spec,
+        optimizer=default_adamw(lr=8e-4),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=2,
+            decay_ratio=0.8,
+            decay_type="linear",
+            min_lr_factor=0.0,
+        ),
+        training=TrainingConfig(
+            local_batch_size=1,
+            seq_len=4096,
             steps=10,
         ),
         dataloader=HuggingFaceTextDataLoader.Config(
