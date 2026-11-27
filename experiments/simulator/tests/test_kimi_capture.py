@@ -11,7 +11,7 @@ import pytest
 import torch
 from torchtitan_simulator.capture.dispatch_capture import OpDispatchCapture
 from torchtitan_simulator.capture.saved_tensors import AutogradSavedTensorCapture
-from torchtitan_simulator.compat.kimi import chunk_kda, fusion_attention, situ_glu
+from torchtitan_simulator.compat.kimi import chunk_kda, situ_glu
 from torchtitan_simulator.config import SimulationConfig
 from torchtitan_simulator.runner import simulate
 from torchtitan_simulator.validation import validate_workload
@@ -48,12 +48,12 @@ def test_kimi_capture_retains_fused_backward_gradients_and_independent_parameter
     for op in (
         "chunk_kda",
         "chunk_kda_grad",
-        "fusion_attention",
-        "fusion_attention_grad",
         "situ_glu",
         "situ_glu_backward",
     ):
         assert counts[f"kimi_sim.{op}.default"] > 0, op
+    assert counts["npu.npu_fusion_attention_v3.default"] > 0
+    assert counts["npu.npu_fusion_attention_grad_v3.default"] > 0
     gradients = annotations["gradient_validation"]
     assert len(gradients) == 110
     for key in (
@@ -92,10 +92,9 @@ def test_kimi_capture_retains_fused_backward_gradients_and_independent_parameter
     "op,backward_name,shapes,attrs",
     [
         (chunk_kda, "chunk_kda_grad", [(1, 8, 2, 4)] * 4 + [(1, 8, 2), (2,), (8,)], (-5.0,)),
-        (fusion_attention, "fusion_attention_grad", [(1, 2, 8, 4)] * 3, (0.5,)),
         (situ_glu, "situ_glu_backward", [(4, 8)] * 2, (4.0, 25.0)),
     ],
-    ids=["kda", "mla", "situ"],
+    ids=["kda", "situ"],
 )
 def test_virtual_fusion_saves_actual_inputs_and_preserves_backward_identity_and_dependencies(
     op, backward_name, shapes, attrs

@@ -67,6 +67,39 @@ def host_only_work():
         _host_only_work.reset(token)
 
 
+_attention_geometry: ContextVar[tuple[str, dict[str, Any]] | None] = ContextVar("attention_geometry", default=None)
+
+
+@contextmanager
+def capture_attention_geometry(primitive: str, **facts: Any) -> Iterator[None]:
+    """Record host-known attention facts on exactly one native operator kind."""
+    token = _attention_geometry.set((primitive, facts))
+    try:
+        yield
+    finally:
+        _attention_geometry.reset(token)
+
+
+def _smla_host_geometry(kwargs: dict[str, Any]) -> dict[str, tuple[int, ...]]:
+    """Read document lengths carried from the host metadata builder."""
+
+    def lengths(bank: str) -> tuple[int, ...] | None:
+        used = getattr(kwargs.get(f"seqused_{bank}"), "_sim_host_attention_values", None)
+        if used is not None:
+            return used
+        offsets = getattr(kwargs.get(f"cu_seqlens_{bank}"), "_sim_host_attention_values", None)
+        if offsets is None:
+            return None
+        return tuple(right - left for left, right in itertools.pairwise(offsets))
+
+    fields = {
+        "query_lens": "q",
+        "kv_lens": "ori_kv",
+        "compressed_lens": "cmp_kv",
+    }
+    return {name: value for name, bank in fields.items() if (value := lengths(bank)) is not None}
+
+
 @contextmanager
 def annotate_active_capture_events(provenance: str) -> Iterator[None]:
     """Annotate dispatch events of the active capture, if any.
@@ -104,6 +137,7 @@ def record_host_boundary(sources, derived: torch.Tensor) -> None:
     for source in sources:
         if source is not None:
             parents.add(capture.tensor_id(source))
+
 
 def _next_op_id() -> int:
     return next(_id_counter)
@@ -418,6 +452,16 @@ class OpDispatchCapture(TorchDispatchMode):
                 argument.name: kwargs[argument.name] for argument in func._schema.arguments if argument.name in kwargs
             }
         attrs = operator_attributes(func, args, attribute_kwargs)
+        geometry = _attention_geometry.get()
+        if geometry is not None and str(func) == geometry[0]:
+            attrs["attention_geometry"] = tuple(sorted(geometry[1].items()))
+        elif str(func) in (
+            "cann_ops_transformer.sparse_flash_mla.default",
+            "cann_ops_transformer.sparse_flash_mla_grad.default",
+        ):
+            host_geometry = _smla_host_geometry(kwargs)
+            if host_geometry:
+                attrs["attention_geometry"] = tuple(sorted(host_geometry.items()))
         if str(func) == "aten._fused_adamw_.default":
             from torchtitan_simulator.capture.optimizer import bind_fused_adamw_inputs, optimizer_annotations
 

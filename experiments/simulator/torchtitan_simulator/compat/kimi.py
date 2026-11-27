@@ -70,40 +70,6 @@ def _kda_backward(ctx, dy):
 chunk_kda.register_autograd(_kda_backward, setup_context=_kda_setup)
 
 
-@torch.library.custom_op("kimi_sim::fusion_attention", mutates_args=())
-def fusion_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float) -> torch.Tensor:
-    raise RuntimeError("Kimi virtual attention is available only for Meta simulation")
-
-
-@fusion_attention.register_fake
-def _attention_meta(q, k, v, scale):
-    return torch.empty_like(q)
-
-
-@torch.library.custom_op("kimi_sim::fusion_attention_grad", mutates_args=())
-def fusion_attention_grad(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, dy: torch.Tensor, scale: float
-) -> list[torch.Tensor]:
-    raise RuntimeError("Kimi virtual attention backward is available only for Meta simulation")
-
-
-@fusion_attention_grad.register_fake
-def _attention_grad_meta(q, k, v, dy, scale):
-    return [torch.empty_like(t) for t in (q, k, v)]
-
-
-def _attention_setup(ctx, inputs, output):
-    ctx.save_for_backward(*inputs[:3])
-    ctx.scale = inputs[3]
-
-
-def _attention_backward(ctx, dy):
-    return (*fusion_attention_grad(*ctx.saved_tensors, dy, ctx.scale), None)
-
-
-fusion_attention.register_autograd(_attention_backward, setup_context=_attention_setup)
-
-
 @torch.library.custom_op("kimi_sim::situ_glu", mutates_args=())
 def situ_glu(gate: torch.Tensor, up: torch.Tensor, beta: float, linear_beta: float | None) -> torch.Tensor:
     raise RuntimeError("Kimi virtual SiTU is available only for Meta simulation")
@@ -138,8 +104,7 @@ def _situ_backward(ctx, dy):
 situ_glu.register_autograd(_situ_backward, setup_context=_situ_setup)
 
 
-# These layouts are part of the fusion boundary in KimiDeltaAttention and
-# KimiGatedMLA, not deductions from tensor sizes. MLA values are already padded.
+# KimiDeltaAttention specifies these layouts independently of tensor dimensions.
 _KDA_INPUTS = (
     ("q", TensorMeaning("query", ("batch", "sequence", "head", "key_head_dim"))),
     ("k", TensorMeaning("key", ("batch", "sequence", "head", "key_head_dim"))),
@@ -150,12 +115,6 @@ _KDA_INPUTS = (
     ("dt_bias", TensorMeaning("time_step_bias", (("head", "key_head_dim"),))),
 )
 _KDA_OUTPUT = TensorMeaning("attention_output", ("batch", "sequence", "head", "value_head_dim"))
-_ATTENTION_INPUTS = (
-    ("q", TensorMeaning("query", ("batch", "head", "q_len", "qk_head_dim"))),
-    ("k", TensorMeaning("key", ("batch", "head", "kv_len", "qk_head_dim"))),
-    ("v", TensorMeaning("value", ("batch", "head", "kv_len", "padded_value_head_dim"))),
-)
-_ATTENTION_OUTPUT = TensorMeaning("attention_output", ("batch", "head", "q_len", "padded_value_head_dim"))
 # SiTU accepts both dense and routed expert rows. Only the final feature axis
 # is defined at this boundary; rank does not identify batch or token axes.
 _SITU_INPUTS = (
@@ -182,12 +141,11 @@ def _register_fusion_semantics(
 
 
 _register_fusion_semantics(chunk_kda, chunk_kda_grad, _KDA_INPUTS, _KDA_OUTPUT)
-_register_fusion_semantics(fusion_attention, fusion_attention_grad, _ATTENTION_INPUTS, _ATTENTION_OUTPUT)
 _register_fusion_semantics(situ_glu, situ_glu_backward, _SITU_INPUTS, _SITU_OUTPUT)
 
 
 def install_kimi_virtual_fusions(scope):
-    """Replace only the three legacy fusion call sites, restoring them on exit."""
+    """Install the retained KDA and SiTU fusions and the native MLA capture seam."""
     from torchtitan_npu.models.kimi_k3.attention import KimiDeltaAttention, KimiGatedMLA
     from torchtitan_npu.models.kimi_k3.feed_forward import SituGLU
 
@@ -197,7 +155,9 @@ def install_kimi_virtual_fusions(scope):
         return chunk_kda(q, k, v, g, beta, a, bias, module.gate_lower_bound)
 
     def attention(module, q, k, v):
-        return fusion_attention(q, k, v, module.scaling)
+        from torchtitan_simulator.compat.attention import causal_fusion_attention_v3
+
+        return causal_fusion_attention_v3(q, k, v, module.scaling)
 
     def activation(module, packed):
         gate, up = packed.chunk(2, dim=-1)

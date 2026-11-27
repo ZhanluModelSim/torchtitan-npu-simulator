@@ -65,7 +65,7 @@ def test_qwen3_5_param_formula_matches_native_geometry():
     ],
     ids=["single", "fsdp-first", "fsdp-last", "hsdp", "full-ac", "selective-ac"],
 )
-def test_qwen3_5_capture_reaches_iteration_with_virtual_gdn_and_flex_boundaries(world, replicate, rank, ac):
+def test_qwen3_5_capture_reaches_iteration_with_gdn_and_native_causal_attention(world, replicate, rank, ac):
     workload = simulate(
         SimulationConfig(
             config="qwen3_5_debugmodel",
@@ -83,8 +83,8 @@ def test_qwen3_5_capture_reaches_iteration_with_virtual_gdn_and_flex_boundaries(
     for op in (
         "qwen3_5_sim.gated_delta_rule.default",
         "qwen3_5_sim.gated_delta_rule_grad.default",
-        "qwen3_5_sim.flex_attention.default",
-        "qwen3_5_sim.flex_attention_grad.default",
+        "npu.npu_fusion_attention_v3.default",
+        "npu.npu_fusion_attention_grad_v3.default",
     ):
         assert counts[op] > 0, op
     gradients = workload.iteration.schedule.annotations["gradient_validation"]
@@ -100,8 +100,6 @@ def test_qwen3_5_capture_reaches_iteration_with_virtual_gdn_and_flex_boundaries(
     assert {n.annotations["raw_op_type"] for n in custom} == {
         "qwen3_5_sim.gated_delta_rule.default",
         "qwen3_5_sim.gated_delta_rule_grad.default",
-        "qwen3_5_sim.flex_attention.default",
-        "qwen3_5_sim.flex_attention_grad.default",
     }
     assert all(
         "tensor_semantics" not in n.attrs
@@ -119,43 +117,20 @@ def test_qwen3_5_capture_reaches_iteration_with_virtual_gdn_and_flex_boundaries(
             assert [item["index"] for item in node.attrs["tensor_semantics"][key]] == list(range(len(tensors)))
             for item in node.attrs["tensor_semantics"][key]:
                 assert len(item["axes"]) == len(tensors[item["index"]].shape)
-    gdn_forward = next(
-        n
-        for n in custom
-        if n.annotations["raw_op_type"] == "qwen3_5_sim.gated_delta_rule.default"
-    )
+    gdn_forward = next(n for n in custom if n.annotations["raw_op_type"] == "qwen3_5_sim.gated_delta_rule.default")
     roles = [item["role"] for item in gdn_forward.attrs["tensor_semantics"]["inputs"]]
     # The fixed-length path still materializes a per-document reset mask from
     # cu_seqlens; the direct-dispatch test covers the absent-reset branch.
     assert roles == ["query", "key", "value", "decay_gate", "update_gate", "state_reset_mask"]
     assert tuple(gdn_forward.inputs[5].shape) == (1, 16)
-    flex_forwards = [
-        n for n in custom if n.annotations["raw_op_type"] == "qwen3_5_sim.flex_attention.default"
-    ]
-    assert flex_forwards
-    for node in flex_forwards:
-        bindings = {item["role"]: item for item in node.attrs["tensor_semantics"]["inputs"]}
-        # The causal BlockMask payload stays connected to every flex fusion
-        # node as dependency inputs with declared mask semantics (PR #19
-        # review): the block counts and indices per query block, full-block
-        # documentary counts included, survive into the captured node facts
-        # instead of being dropped at the boundary.
-        expected_flex_roles = {
-            "key_block_count_mask",
-            "key_block_index_mask",
-            "query_block_count_mask",
-            "query_block_index_mask",
-            "full_key_block_count_mask",
-            "full_key_block_index_mask",
-            "full_query_block_count_mask",
-            "full_query_block_index_mask",
-        }
-        assert expected_flex_roles <= set(bindings)
-        counts_tensor = node.inputs[bindings["key_block_count_mask"]["index"]]
-        indices_tensor = node.inputs[bindings["key_block_index_mask"]["index"]]
-        assert len(counts_tensor.shape) == 3 and len(indices_tensor.shape) == 4
-        assert counts_tensor.dtype == "int32" and indices_tensor.dtype == "int32"
-        assert counts_tensor.shape[:3] == indices_tensor.shape[:3]
+    native = [n for n in nodes if n.annotations["raw_op_type"] == "npu.npu_fusion_attention_v3.default"]
+    assert native
+    for node in native:
+        bindings = dict(node.attrs["input_tensor_bindings"])
+        assert bindings["atten_mask"] is not None
+        assert node.attrs["sparse_mode"] == 3
+        assert node.inputs[bindings["atten_mask"]].dtype == "bool"
+        assert dict(node.attrs["attention_geometry"])["query_lens"] == (16,)
 
 
 @pytest.mark.parametrize(
@@ -265,9 +240,7 @@ def test_qwen3_5_fusion_semantics_declare_roles_and_skip_absent_reset():
         "key_gradient",
         "value_gradient",
     ]
-    assert all(
-        "tensor_semantics" not in node.attrs for raw, node in nodes.items() if raw.startswith("aten.")
-    )
+    assert all("tensor_semantics" not in node.attrs for raw, node in nodes.items() if raw.startswith("aten."))
     json.dumps(gdn.attrs["tensor_semantics"], allow_nan=False)
     json.dumps(flex.attrs["tensor_semantics"], allow_nan=False)
 
@@ -352,11 +325,21 @@ def test_qwen3_5_flex_bridge_rejects_unsupported_requests_and_mask_fields():
     # score_mod programs and auxiliary-output requests are rejected explicitly
     # instead of being silently ignored (PR #19 review).
     with pytest.raises(NotImplementedError, match="score_mod"):
-        _flex_bridge(q, k, v, score_mod=object(), block_mask=None, scale=0.125,
-                      enable_gqa=True, return_aux=None, kernel_options={})
+        _flex_bridge(
+            q,
+            k,
+            v,
+            score_mod=object(),
+            block_mask=None,
+            scale=0.125,
+            enable_gqa=True,
+            return_aux=None,
+            kernel_options={},
+        )
     with pytest.raises(NotImplementedError, match="auxiliary outputs"):
-        _flex_bridge(q, k, v, score_mod=None, block_mask=None, scale=0.125,
-                     enable_gqa=True, return_aux=True, kernel_options={})
+        _flex_bridge(
+            q, k, v, score_mod=None, block_mask=None, scale=0.125, enable_gqa=True, return_aux=True, kernel_options={}
+        )
     # BlockMask tensor fields outside the declared boundary are rejected.
     from torchtitan_simulator.compat.qwen3_5 import _blockmask_payload
 
@@ -364,8 +347,17 @@ def test_qwen3_5_flex_bridge_rejects_unsupported_requests_and_mask_fields():
     with pytest.raises(NotImplementedError, match="seq_lengths"):
         _blockmask_payload(varlen_mask)
     # The supported causal payload passes through and reaches the fusion op.
-    out, aux = _flex_bridge(q, k, v, score_mod=None, block_mask=causal_mask, scale=0.125,
-                            enable_gqa=True, return_aux=None, kernel_options={})
+    out, aux = _flex_bridge(
+        q,
+        k,
+        v,
+        score_mod=None,
+        block_mask=causal_mask,
+        scale=0.125,
+        enable_gqa=True,
+        return_aux=None,
+        kernel_options={},
+    )
     assert out.shape == q.shape
     assert not aux.lse
 
@@ -415,12 +407,8 @@ def test_qwen3_5_default_overrides_reach_gdn_kernel_and_moe_dispatcher():
     # experts module, so the override contract is asserted on the derived
     # config tree rather than on built submodule types.
     model_config = prepared.trainer.model_spec.model
-    dispatcher_cfgs = [
-        layer.moe.routed_experts.token_dispatcher for layer in model_config.layers
-    ]
-    assert dispatcher_cfgs and all(
-        isinstance(cfg, AscAllToAllTokenDispatcher.Config) for cfg in dispatcher_cfgs
-    )
+    dispatcher_cfgs = [layer.moe.routed_experts.token_dispatcher for layer in model_config.layers]
+    assert dispatcher_cfgs and all(isinstance(cfg, AscAllToAllTokenDispatcher.Config) for cfg in dispatcher_cfgs)
 
 
 def test_qwen3_5_rejects_mtp_modules():

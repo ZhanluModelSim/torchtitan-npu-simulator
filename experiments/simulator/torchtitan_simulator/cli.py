@@ -57,6 +57,12 @@ def main(argv=None):
         help="Opt-in the multi_head_moe SLA2 virtual fusions; the default runs the reference eager operators",
     )
     parser.add_argument(
+        "--simulation.kimi-k31-short-sparse",
+        dest="kimi_k31_short_sparse",
+        action="store_true",
+        help="Capture Kimi K3.1 short causal sequences with native absorbed SFA",
+    )
+    parser.add_argument(
         "--activation-checkpoint.mode",
         dest="activation_checkpoint_mode",
         choices=["none", "full", "selective"],

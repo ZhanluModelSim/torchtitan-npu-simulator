@@ -37,6 +37,7 @@ def _fusion_attention_v3(
     scale,
     pre_tockens,
     next_tockens,
+    host_actual_seq=None,
 ):
     """Single seam for the fused op; the simulator replaces it on Meta devices."""
     result = torch_npu.npu_fusion_attention_v3(
@@ -97,6 +98,7 @@ class AscVarlenAttention(VarlenAttention):
         if causal_mask is None or causal_mask.device != query.device:
             causal_mask = torch.triu(torch.ones(mask_len, mask_len, dtype=torch.bool, device=query.device), diagonal=1)
             self._causal_mask = causal_mask
+        host_seq = attention_masks.cu_seq_q_host
         out = _fusion_attention_v3(
             query=query,
             key=key,
@@ -107,6 +109,7 @@ class AscVarlenAttention(VarlenAttention):
             scale=head_dim**-0.5 if scale is None else scale,
             pre_tockens=length,
             next_tockens=0,
+            host_actual_seq=host_seq,
         )
         return out.view(batch, length, hq, head_dim).to(q_BLNH.dtype)
 

@@ -29,6 +29,17 @@ _BLOCKMASK_TENSOR_FIELDS = (
 )
 
 
+_ATTENTION_HOST_FIELDS = {
+    "cu_seq_q",
+    "cu_seq_k",
+    "cu_seqlens",
+    "cu_seqlens_q",
+    "cu_seqlens_ori_kv",
+    "cu_seqlens_cmp_k",
+    "seqused",
+}
+
+
 def iter_metadata_tensors(value):
     """Visit tensor leaves of native metadata without retaining duplicate owners."""
     seen = set()
@@ -78,7 +89,17 @@ def to_meta_metadata(value, *, host_splits=()):
             result = copy.copy(item)
             memo[id(item)] = result
             for field in fields(item):
-                object.__setattr__(result, field.name, lift(getattr(item, field.name), field_name=field.name))
+                source = getattr(item, field.name)
+                lifted = lift(source, field_name=field.name)
+                if (
+                    field.name in _ATTENTION_HOST_FIELDS
+                    and isinstance(source, torch.Tensor)
+                    and source.device.type == "cpu"
+                    and source.ndim == 1
+                    and source.dtype in (torch.int32, torch.int64)
+                ):
+                    lifted._sim_host_attention_values = tuple(source.tolist())
+                object.__setattr__(result, field.name, lifted)
             return result
         if isinstance(item, torch.nn.attention.flex_attention.BlockMask):
             result = copy.copy(item)
@@ -91,8 +112,16 @@ def to_meta_metadata(value, *, host_splits=()):
         if isinstance(item, dict):
             result = {key: lift(child) for key, child in item.items()}
         elif isinstance(item, tuple):
-            values = tuple(lift(child) for child in item)
-            result = type(item)(*values) if hasattr(item, "_fields") else values
+            field_names = getattr(item, "_fields", None)
+            if field_names is None:
+                result = tuple(lift(child) for child in item)
+            else:
+                values = {name: lift(child, field_name=name) for name, child in zip(field_names, item, strict=True)}
+                if "cu_seq_q_host" in values and values["cu_seq_q_host"] is None:
+                    offsets = item.cu_seq_q
+                    if offsets.device.type == "cpu":
+                        values["cu_seq_q_host"] = tuple(offsets.tolist())
+                result = type(item)(**values)
         elif isinstance(item, list):
             result = [lift(child) for child in item]
         else:

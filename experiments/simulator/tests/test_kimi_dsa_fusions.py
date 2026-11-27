@@ -7,31 +7,32 @@
 
 import pytest
 import torch
-from torchtitan_simulator.compat.kimi_dsa import dsa_attention, dsa_indexer, install_kimi_dsa_virtual_fusions
+from torchtitan_simulator.compat.kimi_dsa import _native_sparse, dsa_indexer, install_kimi_dsa_native_capture
 from torchtitan_simulator.compat.patches import PatchScope
 
 
-def test_selected_attention_saves_forward_values_and_has_distinct_value_gradient_width():
-    q = torch.empty((2, 3, 12, 7), device="meta", requires_grad=True)
-    k = torch.empty_like(q, requires_grad=True)
-    v = torch.empty((2, 3, 12, 4), device="meta", requires_grad=True)
-    idx = torch.empty((2, 12, 5), dtype=torch.int64, device="meta")
-    saved = []
+def test_native_sfa_saves_actual_statistics_and_shared_latent_gradients():
+    pytest.importorskip("torch_npu")
+    from torchtitan_simulator.capture.dispatch_capture import OpDispatchCapture
 
-    def pack(tensor):
-        saved.append(tensor)
-        return tensor
-
-    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
-        out, lse = dsa_attention(q, k, v, idx, 7**-0.5)
+    q = torch.empty((2, 12, 4, 512), device="meta", dtype=torch.bfloat16, requires_grad=True)
+    kv = torch.empty((2, 12, 1, 512), device="meta", dtype=torch.bfloat16, requires_grad=True)
+    qr = torch.empty((2, 12, 4, 64), device="meta", dtype=torch.bfloat16, requires_grad=True)
+    kr = torch.empty((2, 12, 1, 64), device="meta", dtype=torch.bfloat16, requires_grad=True)
+    idx = torch.empty((2, 12, 5), device="meta", dtype=torch.int64)
+    capture = OpDispatchCapture()
+    with capture:
+        out = _native_sparse(q, kv, qr, kr, idx, 192**-0.5, 5, "test_topk")
         out.sum().backward()
-    assert out.shape == v.shape and lse.shape == (2, 3, 12)
-    assert lse.dtype == torch.float32 and not lse.requires_grad
-    assert len(saved) == 6
-    # Compare storage identity, not values or coincidentally equal shapes.
-    assert [t.untyped_storage()._cdata for t in saved] == [t.untyped_storage()._cdata for t in (q, k, v, idx, out, lse)]
-    assert [t.grad.shape for t in (q, k, v)] == [q.shape, k.shape, v.shape]
-    assert [t.grad.dtype for t in (q, k, v)] == [q.dtype, k.dtype, v.dtype]
+    assert out.shape == q.shape
+    events = {event.raw_op_type: event for event in capture.memory_events()}
+    forward = events["npu.npu_sparse_flash_attention.default"]
+    backward = events["npu.npu_sparse_flash_attention_grad.default"]
+    assert forward.inputs[1].storage_key == forward.inputs[2].storage_key
+    saved = {tensor.storage_key for tensor in backward.inputs}
+    assert all(value.storage_key in saved for value in forward.outputs)
+    for value in (q, kv, qr, kr):
+        assert value.grad.shape == value.shape and value.grad.dtype == value.dtype
 
 
 def test_indexer_shape_and_frozen_integer_result():
@@ -48,37 +49,86 @@ def test_dsa_patch_restores_native_selection_on_normal_and_exception_exit(fail):
     from torchtitan_npu.models.kimi_k3_1 import attention
     from torchtitan_npu.models.kimi_k3_1.dsa import KimiDSAIndexer
 
-    original = KimiDSAIndexer._select, attention.selected_key_attention
+    original = KimiDSAIndexer._select, attention.KimiGatedDSA._project_attention
     try:
         with PatchScope() as patches:
-            install_kimi_dsa_virtual_fusions(patches)
-            assert (KimiDSAIndexer._select, attention.selected_key_attention) != original
-            q = torch.empty((1, 2, 6, 4), device="meta", requires_grad=True)
-            v = torch.empty((1, 2, 6, 3), device="meta", requires_grad=True)
-            idx = torch.empty((1, 6, 2), device="meta", dtype=torch.int64)
-            result = attention.selected_key_attention(q, q, v, idx, 0.5)
-            assert result.shape == (1, 2, 6, 3)
+            install_kimi_dsa_native_capture(patches)
+            assert KimiDSAIndexer._select is not original[0]
+            assert attention.KimiGatedDSA._project_attention is not original[1]
             if fail:
                 raise RuntimeError("intentional session failure")
     except RuntimeError as error:
         assert fail and str(error) == "intentional session failure"
-    assert (KimiDSAIndexer._select, attention.selected_key_attention) == original
+    assert (KimiDSAIndexer._select, attention.KimiGatedDSA._project_attention) == original
 
 
-def test_dsa_fake_rejects_invalid_precision_scale_and_saved_placement():
-    from torchtitan_simulator.compat.kimi_dsa import _attention_grad_meta, _indexer_meta
+def test_indexer_fake_rejects_invalid_precision():
+    from torchtitan_simulator.compat.kimi_dsa import _indexer_meta
 
     iq = torch.empty((1, 6, 2, 4), device="meta", dtype=torch.int64)
     ik = torch.empty((1, 6, 4), device="meta", dtype=torch.int64)
     iw = torch.empty((1, 6, 2), device="meta")
     with pytest.raises(ValueError, match="floating-point"):
         _indexer_meta(iq, ik, iw, 2)
-    q = torch.empty((1, 2, 6, 4), device="meta")
-    v = torch.empty((1, 2, 6, 3), device="meta")
-    idx = torch.empty((1, 6, 2), device="meta", dtype=torch.int64)
-    with pytest.raises(ValueError, match="scale"):
-        dsa_attention(q, q, v, idx, float("nan"))
-    out = torch.empty_like(v)
-    lse = torch.empty((1, 2, 6), device="meta")
-    with pytest.raises(ValueError, match="placement"):
-        _attention_grad_meta(q, q, v, idx, out, lse, torch.empty(v.shape), 0.5)
+
+
+def test_absorbing_kv_weights_preserves_output_and_gradients():
+    from types import SimpleNamespace
+
+    from torchtitan_npu.models.kimi_k3_1.attention import KimiGatedDSA
+    from torchtitan_npu.models.kimi_k3_1.dsa import selected_key_attention
+
+    batch, seq, heads, q_dim, rope_dim, k_dim, v_dim = 2, 7, 3, 4, 2, 5, 3
+    generator = torch.Generator().manual_seed(71)
+
+    def value(*shape):
+        return torch.randn(shape, generator=generator, dtype=torch.float64).requires_grad_()
+
+    q, qr, kv, kr = (
+        value(batch, seq, heads, q_dim),
+        value(batch, seq, heads, rope_dim),
+        value(batch, seq, k_dim),
+        value(batch, seq, rope_dim),
+    )
+    weight = value(heads * (q_dim + v_dim), k_dim)
+    module = SimpleNamespace(
+        num_heads=heads,
+        qk_nope_head_dim=q_dim,
+        v_head_dim=v_dim,
+        kv_lora_rank=k_dim,
+        kv_b_proj=SimpleNamespace(weight=weight),
+    )
+    scale = (q_dim + rope_dim) ** -0.5
+    position = torch.arange(seq)
+    indices = (position[:, None] - torch.arange(3)).clamp_min(0).expand(batch, seq, 3)
+    k, v = (
+        torch.nn.functional.linear(kv, weight).reshape(batch, seq, heads, q_dim + v_dim).split((q_dim, v_dim), dim=-1)
+    )
+    expanded_key = torch.cat((k, kr.unsqueeze(2).expand(-1, -1, heads, -1)), dim=-1)
+    expected = selected_key_attention(
+        torch.cat((q, qr), dim=-1).transpose(1, 2),
+        expanded_key.transpose(1, 2),
+        v.transpose(1, 2),
+        indices,
+        scale,
+    )
+
+    def absorbed_kernel(aq, akv, aq_rope, ak_rope, idx):
+        key = torch.cat((akv, ak_rope), dim=-1).expand(-1, -1, heads, -1)
+        return selected_key_attention(
+            torch.cat((aq, aq_rope), dim=-1).transpose(1, 2),
+            key.transpose(1, 2),
+            akv.expand(-1, -1, heads, -1).transpose(1, 2),
+            idx,
+            scale,
+        ).transpose(1, 2)
+
+    actual = KimiGatedDSA._absorbed_attention(module, q, qr, kv, kr, indices, absorbed_kernel)
+    torch.testing.assert_close(actual, expected, rtol=1e-11, atol=1e-12)
+    upstream = value(*actual.shape).detach()
+    for gradient, reference in zip(
+        torch.autograd.grad(actual, (q, qr, kv, kr, weight), upstream),
+        torch.autograd.grad(expected, (q, qr, kv, kr, weight), upstream),
+        strict=True,
+    ):
+        torch.testing.assert_close(gradient, reference, rtol=1e-11, atol=1e-12)

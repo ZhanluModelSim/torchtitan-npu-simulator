@@ -39,16 +39,24 @@ class RuntimeSession:
             from torchtitan_simulator.compat.swiglu import install_meta_swiglu_autograd
 
             self.capabilities["swiglu_meta_autograd"] = install_meta_swiglu_autograd(self.patches)
+        if prepared.trainer.model_spec.name in {"kimi_k3", "kimi_k3_1", "qwen3_5"} or (
+            "torchtitan_npu.override.common.varlen_attention.asc" in prepared.trainer.override.imports
+        ):
+            import spmd_types
+
+            from torchtitan_simulator.compat.attention import _FusionAttentionV3MetaAutograd
+
+            spmd_types.register_local_autograd_function(_FusionAttentionV3MetaAutograd)
         if prepared.trainer.model_spec.name in {"kimi_k3", "kimi_k3_1"}:
             from torchtitan_simulator.compat.kimi import install_kimi_virtual_fusions
 
             install_kimi_virtual_fusions(self.patches)
             self.capabilities["kimi_virtual_fusions"] = "dispatcher Meta/autograd; legacy fusion boundaries"
         if prepared.trainer.model_spec.name == "kimi_k3_1":
-            from torchtitan_simulator.compat.kimi_dsa import install_kimi_dsa_virtual_fusions
+            from torchtitan_simulator.compat.kimi_dsa import install_kimi_dsa_native_capture
 
-            install_kimi_dsa_virtual_fusions(self.patches)
-            self.capabilities["kimi_dsa_virtual_fusions"] = "selected-key Meta/autograd; explicit saved output/LSE"
+            install_kimi_dsa_native_capture(self.patches, short_sparse=prepared.simulation.kimi_k31_short_sparse)
+            self.capabilities["kimi_dsa_native_capture"] = "absorbed SFA with shared latent KV and native gradients"
         if prepared.trainer.model_spec.name == "system3":
             from torchtitan_simulator.compat.system3_engram import install_system3_engram_meta_support
             from torchtitan_simulator.compat.system3_fusions import install_system3_virtual_fusions
@@ -121,8 +129,11 @@ class RuntimeSession:
             isinstance(entry, str) and entry.startswith("torchtitan_npu.override.deepseek_v4.sparse_attn.asc")
             for entry in imports
         ):
+            from torchtitan_simulator.compat.smla import install_deepseek_v4_smla_geometry
+
             owner = import_module("torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc")
             self.capabilities["cann_metadata"] = install_metadata_dispatch(self.patches, owner)
+            install_deepseek_v4_smla_geometry(self.patches, owner)
 
 
 @contextmanager

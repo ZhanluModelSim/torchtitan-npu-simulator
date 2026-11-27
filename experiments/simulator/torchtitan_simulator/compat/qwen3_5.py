@@ -323,9 +323,7 @@ def _blockmask_payload(block_mask):
         if name in _FLEX_BLOCKMASK_FIELDS:
             continue
         if isinstance(getattr(block_mask, name, None), torch.Tensor):
-            raise NotImplementedError(
-                f"Qwen3.5 simulator flex fusion does not capture the BlockMask field {name!r}"
-            )
+            raise NotImplementedError(f"Qwen3.5 simulator flex fusion does not capture the BlockMask field {name!r}")
     return tuple(payload)
 
 
@@ -338,10 +336,13 @@ def _flex_bridge(q_BNLH, k_BNLH, v_BNLH, **kwargs):
             "score_mod programs are outside the declared boundary"
         )
     if _requests_auxiliary_outputs(kwargs["return_aux"]):
-        raise NotImplementedError(
-            "Qwen3.5 simulator flex fusion does not capture FlexAttention auxiliary outputs"
-        )
+        raise NotImplementedError("Qwen3.5 simulator flex fusion does not capture FlexAttention auxiliary outputs")
     block_mask = kwargs["block_mask"]
+    if getattr(block_mask, "_sim_single_document_causal", False):
+        from torchtitan_simulator.compat.attention import causal_fusion_attention_v3
+
+        out = causal_fusion_attention_v3(q_BNLH, k_BNLH, v_BNLH, kwargs["scale"])
+        return out, _make_aux_output()
     mask_payload = (None,) * len(_FLEX_BLOCKMASK_FIELDS)
     if block_mask is not None:
         mask_payload = _blockmask_payload(block_mask)
@@ -377,7 +378,15 @@ def _build_attention_masks(self, tokens, labels, extra_inputs, *, cp_mesh=None, 
         raise NotImplementedError("Qwen3.5 simulator capture does not support context parallel")
     extra = dict(extra_inputs)
     extra.setdefault("special_tokens", dict(_TEXT_SPECIAL_TOKENS))
-    extra["attention_masks"] = self.get_attention_masks(extra["positions"])
+    masks = self.get_attention_masks(extra["positions"])
+    # The synthetic runner supplies arange positions and one document per sample.
+    # Mark only the exact Flex masks built by this text capture input adapter.
+    from torch.nn.attention.flex_attention import BlockMask
+
+    for mask in masks.values() if isinstance(masks, dict) else (masks,):
+        if isinstance(mask, BlockMask):
+            mask._sim_single_document_causal = True
+    extra["attention_masks"] = masks
     return tokens, labels, extra
 
 
