@@ -25,6 +25,7 @@ import torch
 from torchtitan_npu.models.deepseek_v4.compressor import InnerIndexer
 from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.override.a3_workaround import A3KeyWorkaround
+from torchtitan_npu.override.deepseek_v4.lightning_indexer.ascendc import sort_indices_and_scores
 from torchtitan_npu.override.deepseek_v4.metadata import (
     AscV4Metadata,
     lightning_indexer_options,
@@ -92,8 +93,8 @@ class _PyPTOIndexerTND(torch.autograd.Function):
             return_value=1,
             **options,
         )
-        topk_indices, order = topk_indices.sort(dim=-1, descending=True)
-        topk_scores = topk_scores.gather(-1, order).float().masked_fill(topk_indices < 0, -torch.inf)
+        topk_indices, topk_scores = sort_indices_and_scores(topk_indices, topk_scores)
+        topk_scores = topk_scores.float().masked_fill(topk_indices < 0, -torch.inf)
         ctx.set_materialize_grads(False)
         ctx.save_for_backward(idx_q, idx_k, idx_w, topk_indices)
         ctx.ratio = ratio

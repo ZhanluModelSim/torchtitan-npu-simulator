@@ -18,6 +18,28 @@ from torchtitan_npu.override.deepseek_v4.metadata import (
 )
 
 
+def _uses_fp32_sort(indices: torch.Tensor) -> bool:
+    return indices.device.type == "npu" and indices.dtype == torch.int32
+
+
+def sort_indices_and_scores(
+    indices: torch.Tensor,
+    scores: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sort top-k indices descending and align scores, keeping NPU sort on AI Core.
+
+    CANN dispatches ``int32.sort`` to AI_CPU while ``float32.sort`` runs on AI Core.
+    Compressed document-local indices (including ``-1`` padding) are exact in FP32
+    up to ``2**24`` (~16.7M compressed keys).
+    """
+    if _uses_fp32_sort(indices):
+        sorted_fp32, order = indices.float().sort(dim=-1, descending=True, stable=True)
+        indices = sorted_fp32.to(indices.dtype)
+    else:
+        indices, order = indices.sort(dim=-1, descending=True)
+    return indices, scores.gather(-1, order)
+
+
 class _LightningIndexerTND(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, w, topk, attention_metadata, options):  # pyrefly: ignore [bad-override]
@@ -26,8 +48,7 @@ class _LightningIndexerTND(torch.autograd.Function):
         )
         # Keep SMLA's accumulation order. Sort before saving the indices so SLIKG
         # sees exactly the slots used to compute SMLAG's teacher.
-        indices, order = indices.sort(dim=-1, descending=True)
-        scores = scores.gather(-1, order)
+        indices, scores = sort_indices_and_scores(indices, scores)
         ctx.save_for_backward(q, k, w, indices)
         ctx.attention_metadata = attention_metadata
         ctx.options = options

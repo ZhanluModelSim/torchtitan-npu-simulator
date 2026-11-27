@@ -15,8 +15,10 @@ and both kernel calls read the metadata the fused attention precomputed.
 import pytest
 import torch
 
+from torchtitan_npu.override.deepseek_v4.lightning_indexer import ascendc
 from torchtitan_npu.override.deepseek_v4.lightning_indexer.ascendc import (
     AscInnerIndexer,
+    sort_indices_and_scores,
 )
 from torchtitan_npu.override.deepseek_v4.metadata import lightning_indexer_options
 from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import (
@@ -72,8 +74,11 @@ def _kernel_indices() -> torch.Tensor:
     )
 
 
-def test_kernel_scores_and_backward_teacher_keep_the_same_slots(monkeypatch):
+@pytest.mark.parametrize("use_fp32_sort", [False, True], ids=["native-sort", "fp32-sort"])
+def test_kernel_scores_and_backward_teacher_keep_the_same_slots(monkeypatch, use_fp32_sort):
     """The same permutation moves logits and indices, including padding, before backward."""
+    if use_fp32_sort:
+        monkeypatch.setattr(ascendc, "_uses_fp32_sort", lambda indices: indices.dtype == torch.int32)
     md = _metadata()
     captured = {}
     kernel_scores = torch.arange(_TOKENS * _TOPK, dtype=torch.float32).reshape(_TOKENS, 1, _TOPK)
@@ -174,3 +179,50 @@ def test_the_pypto_entry_selects_the_pypto_selector():
     # The two ports share the base selector's model contract, not each other's bridge.
     assert issubclass(PyPTOInnerIndexer, InnerIndexer)
     assert not issubclass(PyPTOInnerIndexer, AscInnerIndexer)
+
+
+def test_sort_indices_and_scores_fp32_path_matches_exact_descending_order(monkeypatch):
+    """FP32 stable sort keeps compressed indices exact up to 2**24 and preserves ties."""
+    monkeypatch.setattr(ascendc, "_uses_fp32_sort", lambda indices: indices.dtype == torch.int32)
+    indices = torch.tensor(
+        [
+            [3, -1, 16_777_216, 0, -1, 42],
+            [-1, -1, -1, 7, 16_777_215, 7],
+        ],
+        dtype=torch.int32,
+    )
+    scores = torch.tensor(
+        [
+            [0.3, 9.0, 1.5, 0.1, 8.0, 2.2],
+            [4.0, 5.0, 6.0, 0.7, 1.5, 0.8],
+        ],
+        dtype=torch.float32,
+    )
+
+    sorted_indices, sorted_scores = sort_indices_and_scores(indices, scores)
+
+    expected_indices = torch.tensor(
+        [
+            [16_777_216, 42, 3, 0, -1, -1],
+            [16_777_215, 7, 7, -1, -1, -1],
+        ],
+        dtype=torch.int32,
+    )
+    expected_scores = torch.tensor(
+        [
+            [1.5, 2.2, 0.3, 0.1, 9.0, 8.0],
+            [1.5, 0.7, 0.8, 4.0, 5.0, 6.0],
+        ],
+        dtype=torch.float32,
+    )
+    assert sorted_indices.dtype == torch.int32
+    assert torch.equal(sorted_indices, expected_indices)
+    assert torch.equal(sorted_scores, expected_scores)
+
+    # Non-int32 inputs stay on native integer sort to avoid precision loss above 2**24.
+    int64_indices = torch.tensor([[16_777_216, -1, 16_777_217]], dtype=torch.int64)
+    int64_scores = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32)
+    sorted_i64, sorted_i64_scores = sort_indices_and_scores(int64_indices, int64_scores)
+    assert sorted_i64.dtype == torch.int64
+    assert torch.equal(sorted_i64, torch.tensor([[16_777_217, 16_777_216, -1]], dtype=torch.int64))
+    assert torch.equal(sorted_i64_scores, torch.tensor([[3.0, 1.0, 2.0]], dtype=torch.float32))
