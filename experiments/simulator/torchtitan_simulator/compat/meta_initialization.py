@@ -1,21 +1,18 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Avoid unused empty Meta chunks inside audited FSDP initialization methods.
-
-The upstream helper and its public list contract remain untouched. Only private
-function namespaces of the two initialization consumers use the local sequence;
-no parameter, chunk, or function replacement survives the parallelize scope.
-"""
+"""Limit repeated host work while FSDP initializes the Meta model and its meshes."""
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from functools import partial
+from functools import lru_cache, partial, wraps
 from types import CellType, FunctionType
 from typing import overload
 
 import torch
+from torch.distributed.device_mesh import DeviceMesh
 
 from torchtitan_simulator.compat.patches import PatchScope
 
@@ -93,15 +90,72 @@ def _rebind_initializer(method: FunctionType) -> FunctionType:
     return rebound
 
 
+def _cache_mesh_axis_subsets(patches: PatchScope) -> None:
+    try:
+        from spmd_types import MeshAxis
+        from torch.distributed._mesh_layout import _FlatLayout
+    except ImportError:
+        # Older mesh implementations keep their native comparison.
+        return
+
+    native = MeshAxis.__le__
+    # Frozen axes with canonical flat layouts hash by shape and stride.
+    # Keep the ordered pair and the native answer, without retaining rank sets.
+    cached = lru_cache(maxsize=128)(native)
+
+    @wraps(native)
+    def is_subset(left: MeshAxis, right: MeshAxis) -> bool:
+        if (
+            type(left) is MeshAxis
+            and type(right) is MeshAxis
+            and type(left.layout) is _FlatLayout
+            and type(right.layout) is _FlatLayout
+        ):
+            return cached(left, right)
+        return native(left, right)
+
+    def clear_cache() -> None:
+        stats = cached.cache_info()
+        cached.cache_clear()
+        logging.getLogger(__name__).info("Meta FSDP axis subset cache hits=%d misses=%d", stats.hits, stats.misses)
+
+    patches.replace(MeshAxis, "__le__", is_subset)
+    patches.defer(clear_cache)
+
+
 @contextmanager
 def meta_initialization() -> Iterator[None]:
-    """Limit Meta chunk optimization to native FSDP initialization consumers."""
+    """Scope Meta chunk, rank-map and mesh-axis optimizations to native parallelization."""
     import torch.distributed.fsdp._fully_shard._fsdp_param as fsdp_param
 
+    native_mesh_init = DeviceMesh.__init__
+    shared_rank_maps = 0
+
+    @wraps(native_mesh_init)
+    def initialize_mesh(self: DeviceMesh, *args, **kwargs) -> None:
+        nonlocal shared_rank_maps
+        native_mesh_init(self, *args, **kwargs)
+        if self.device_type != "meta":
+            return
+        # PyTorch materializes a world-sized tuple for hashing each submesh.
+        # Reuse the root snapshot only when its backing tensor and ordered values match.
+        root = getattr(self, "_root_mesh", None)
+        rank_map = getattr(self, "_rank_map", None)
+        if rank_map is None or rank_map is not getattr(root, "_rank_map", None):
+            return
+        ranks = getattr(self, "_flatten_rank_map", None)
+        root_ranks = getattr(root, "_flatten_rank_map", None)
+        if type(ranks) is tuple and type(root_ranks) is tuple and ranks is not root_ranks and ranks == root_ranks:
+            self._flatten_rank_map = root_ranks
+            shared_rank_maps += 1
+
     with PatchScope() as patches:
+        _cache_mesh_axis_subsets(patches)
+        patches.replace(DeviceMesh, "__init__", initialize_mesh)
         for name in ("_init_sharded_param", "_init_sharded_post_forward_param_metadata"):
             method = getattr(fsdp_param.FSDPParam, name)
             if not isinstance(method, FunctionType):
                 continue
             patches.replace(fsdp_param.FSDPParam, name, _rebind_initializer(method))
         yield
+    logging.getLogger(__name__).info("Meta FSDP initialization shared_rank_maps=%d", shared_rank_maps)
