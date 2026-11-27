@@ -1819,7 +1819,7 @@ class ImageEncoder(Module):
         self.patch_embed = config.patch_embed.build()
         self.max_patches = config.max_patches
         self.pos_embed = nn.Parameter(torch.zeros(1, config.max_patches, config.patch_embed.out_channels))
-        self._pos_embed_sharding = config.pos_embed_sharding
+        self._sharding_config = config.pos_embed_sharding
         self.blocks = nn.ModuleList([block.build() for block in config.blocks])
         self.norm = config.norm.build()
 
@@ -1865,7 +1865,7 @@ class AudioEncoder(Module):
         self.stem_act2 = GELU(GELU.Config())
         self.max_frames = config.max_frames
         self.pos_embed = nn.Parameter(torch.zeros(1, config.max_frames, config.stem_conv1.out_channels))
-        self._pos_embed_sharding = config.pos_embed_sharding
+        self._sharding_config = config.pos_embed_sharding
         self.blocks = nn.ModuleList([block.build() for block in config.blocks])
         self.norm = config.norm.build()
 
@@ -1947,7 +1947,7 @@ class HapticEncoder(Module):
         self.stem_act = GELU(GELU.Config())
         self.max_frames = config.max_frames
         self.pos_embed = nn.Parameter(torch.zeros(1, config.max_frames, config.stem_conv.out_channels))
-        self._pos_embed_sharding = config.pos_embed_sharding
+        self._sharding_config = config.pos_embed_sharding
         self.blocks = nn.ModuleList([block.build() for block in config.blocks])
         self.norm = config.norm.build()
 
