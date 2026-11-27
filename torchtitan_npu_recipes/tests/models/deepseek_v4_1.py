@@ -343,6 +343,15 @@ def _make_trainer_config(
     if not engram_enabled:
         for layer in model.layers:
             layer.engram = None
+    if parallelism.context_parallel_degree > 1:
+        from torchtitan_npu.override.deepseek_v4.context_parallel import configure_context_parallel
+        from torchtitan_npu.override.deepseek_v4.cp_metadata import document_alignment
+
+        model = configure_context_parallel(model, parallelism)
+        per_doc_alignment = document_alignment(model.compress_ratios, parallelism)
+    else:
+        per_doc_alignment = compression_alignment(model.compress_ratios)
+
     if isinstance(model, DeepSeekV41MultimodalModel.Config):
         dataloader = _vision_dataloader_config(model)
     else:
@@ -354,9 +363,7 @@ def _make_trainer_config(
                         split="train",
                         load_dataset_kwargs={"data_files": _DEFAULT_TEXT_DATA_FILES},
                     ),
-                    processor=AlignedTextProcessor.Config(
-                        per_doc_alignment=compression_alignment(model.compress_ratios)
-                    ),
+                    processor=AlignedTextProcessor.Config(per_doc_alignment=per_doc_alignment),
                     post_filters=(lambda sample: sample is not None,),
                 ),
             ),

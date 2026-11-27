@@ -38,12 +38,13 @@ from torchtitan_npu.extensions.torchtitan.components.checkpoint import Checkpoin
 from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon
 from torchtitan_npu.extensions.torchtitan.tools.profiler import CANNProfiler
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
-from torchtitan_npu.models.common.alignment import AlignedTextProcessor, compression_alignment
+from torchtitan_npu.models.common.alignment import AlignedTextProcessor
 from torchtitan_npu.models.common.muon import make_expert_layout, make_owned_layout, with_lora_compute_layouts
 from torchtitan_npu.models.deepseek_v4 import build_model_config
 from torchtitan_npu.models.deepseek_v4.chat_processor import DeepSeekV4ChatProcessor
 from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4Model
 from torchtitan_npu.models.deepseek_v4.mtp import MTPChunkedLossWrapper
+from torchtitan_npu.override.deepseek_v4.cp_metadata import document_alignment
 
 if TYPE_CHECKING:
     from torchtitan.config.transform import ModelConfigConverter
@@ -59,6 +60,10 @@ def _trainer_config(
     per_doc_alignment: int | None = None,
 ) -> TrainerEx.Config:
     """Assemble the shared text-training components around an explicit model."""
+    if parallelism.context_parallel_degree > 1:
+        from torchtitan_npu.override.deepseek_v4.context_parallel import configure_context_parallel
+
+        model = configure_context_parallel(model, parallelism)
     model.local_compile_regions = []
     if num_mtp_layers > 0:
         loss = MTPChunkedLossWrapper.Config(
@@ -92,7 +97,7 @@ def _trainer_config(
                         path="json", split="train", load_dataset_kwargs={"data_files": data_files}
                     ),
                     processor=AlignedTextProcessor.Config(
-                        per_doc_alignment=compression_alignment(model.compress_ratios)
+                        per_doc_alignment=document_alignment(model.compress_ratios, parallelism)
                         if per_doc_alignment is None
                         else per_doc_alignment
                     ),
@@ -509,8 +514,39 @@ def deepseek_v4_flash_cpt_4k_a5() -> TrainerEx.Config:
 
 
 def deepseek_v4_flash_cpt_1024k_a5() -> TrainerEx.Config:
-    """[TODO] Reserve 128-rank Flash 1M-context CPT on A5 (16 x 8 NPUs) with CP128; unsupported in v0.4.0"""
-    raise NotImplementedError("Context parallelism is deferred in the v0.4 eager upgrade.")
+    """BF16 Flash CPT with document-aligned packing on 128 context ranks."""
+    from dataclasses import replace
+
+    from torchtitan.config import derive
+    from torchtitan.models.common import RoPE
+
+    from torchtitan_npu.config.configs import QuantizationExtensionConfig
+    from torchtitan_npu.override.deepseek_v4.context_parallel import configure_context_parallel
+
+    config = deepseek_v4_flash_cpt_4k_a5()
+    config.extension.quantization = QuantizationExtensionConfig()
+    parallelism = replace(
+        config.parallelism,
+        context_parallel_degree=128,
+        data_parallel_shard_degree=1,
+        context_parallel_load_balancer=None,
+    )
+    length = 1_048_576
+    model = config.model
+    assert isinstance(model, DeepSeekV4Model.Config)
+    model.max_context_length = length
+    model.local_compile_regions = []
+    for _, rope, _, _ in model.traverse(RoPE.Config):
+        rope.max_context_length = length
+    config.training.max_context_length = length
+    config.training.num_tokens_per_microbatch_per_dp_rank = length
+    assert isinstance(config.dataloader, GrainDataLoader.Config)
+    packed = config.dataloader.dataset
+    assert isinstance(packed, ConcatThenSplitPackingConfig) and isinstance(packed.dataset, SingleDatasetConfig)
+    assert isinstance(packed.dataset.processor, AlignedTextProcessor.Config)
+    model = configure_context_parallel(model, parallelism)
+    packed.dataset.processor.per_doc_alignment = document_alignment(model.compress_ratios, parallelism)
+    return derive(config, type(config), parallelism=parallelism, model=model, compile=None)
 
 
 def deepseek_v4_flash_qat_4k_a5() -> TrainerEx.Config:

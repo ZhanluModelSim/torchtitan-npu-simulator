@@ -260,9 +260,8 @@ def _tiny_model(monkeypatch, *, fused: bool):
     config = registry.build_model_config("deepseek_v4_1_debugmodel")
     config.vocab_size = config.tok_embeddings.num_embeddings = config.lm_head.out_features = 64
     if fused:
-        # ``fused`` means the fused stack, not one of its halves: the teacher edge only
-        # exists when both sides are fused, which the model itself enforces.  Ratio-0
-        # layers are left on the reference core because they have no compressed stream.
+        # This recipe selects both ends of the fused teacher edge.
+        # Ratio-0 layers remain on the reference core.
         from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import AscV41SparseAttention
 
         for layer in config.layers:
@@ -569,35 +568,6 @@ def test_full_model_smla_trains_the_indexer_through_the_teacher_edge(monkeypatch
     for name, parameter in indexer_params:
         assert parameter.grad is not None, name
         assert torch.isfinite(parameter.grad).all(), name
-
-
-def test_both_fused_ports_build_the_kernel_stack(monkeypatch):
-    """With both ports derived, the built model carries the kernels rather than the reference."""
-    from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import AscV41SparseAttention
-
-    monkeypatch.setattr(DefaultDeviceType, "_default_device_type", "cpu")
-    registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1.flavors")
-
-    def config(*, fused_selector: bool, fused_core: bool):
-        cfg = registry.build_model_config("deepseek_v4_1_debugmodel")
-        for layer in cfg.layers:
-            # The pair only exists where there is a compressed stream.
-            if layer.attention.inner_attention.compress_ratio == 0:
-                continue
-            if fused_selector:
-                layer.attention.indexer.inner_indexer = derive(
-                    layer.attention.indexer.inner_indexer, AscInnerIndexer.Config
-                )
-            if fused_core:
-                layer.attention.inner_attention = derive(
-                    layer.attention.inner_attention, AscV41SparseAttention.Config, **_TINY_GEOMETRY
-                )
-        return cfg
-
-    with torch.random.fork_rng(devices=[]):
-        model = build_cpu_model(config(fused_selector=True, fused_core=True))
-    assert isinstance(model.layers["2"].attention.inner_attention, AscV41SparseAttention)
-    assert isinstance(model.layers["2"].attention.indexer.inner_indexer, AscInnerIndexer)
 
 
 def test_both_ports_requested_build_matching_teacher_components():

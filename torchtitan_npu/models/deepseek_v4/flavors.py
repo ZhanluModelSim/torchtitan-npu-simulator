@@ -42,7 +42,7 @@ from torchtitan.models.deepseek_v4.sharding import hc_head_sharding_config
 from torchtitan_npu.models.common.activation import LimitedSwiGLU
 
 from .attention import Attention, CompressedSparseAttention, UnitScaleRMSNorm
-from .compressor import Indexer, InnerIndexer
+from .compressor import Compressor, Indexer, InnerIndexer
 from .model import (
     DeepSeekV4Model,
     DeepSeekV4TransformerBlock,
@@ -111,13 +111,21 @@ def _build_dsv4_layers(*, enable_sp: bool, enable_ep: bool, **kwargs):
                 eps=layer.attention.norm_eps,
             ),
         )
-        if layer.attention.indexer is not None:
-            core = layer.attention.inner_attention
-            layer.attention.indexer = derive(
-                layer.attention.indexer, Indexer.Config, inner_indexer=InnerIndexer.Config(index_topk=core.index_topk)
+        attention = layer.attention
+        if attention.compressor is not None:
+            attention.compressor = derive(attention.compressor, Compressor.Config)
+        if attention.compressor_128 is not None:
+            attention.compressor_128 = derive(attention.compressor_128, Compressor.Config)
+        if attention.indexer is not None:
+            core = attention.inner_attention
+            attention.indexer = derive(
+                attention.indexer,
+                Indexer.Config,
+                compressor=derive(attention.indexer.compressor, Compressor.Config),
+                inner_indexer=InnerIndexer.Config(index_topk=core.index_topk),
             )
             assert core.aux_loss is not None
-            layer.attention.inner_attention = derive(
+            attention.inner_attention = derive(
                 core,
                 CompressedSparseAttention.Config,
                 aux_loss=dataclasses.replace(core.aux_loss, coeff=1.0, mass_weighted=True),

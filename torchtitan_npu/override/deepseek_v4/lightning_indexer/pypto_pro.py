@@ -44,11 +44,6 @@ class _ProMetadata(AscV4Metadata):
     frame_versions: tuple[int, ...]
     key_tokens: int
 
-    @staticmethod
-    def prepare_cp_metadata(attention_metadata, *, permutation):
-        local = AscV4Metadata.prepare_cp_metadata(attention_metadata, permutation=permutation)
-        return _validate_compact_frames(local)
-
 
 if _ProMetadata not in SUPPORTED_NODES:
     register_dataclass(_ProMetadata, serialized_type_name=f"{_ProMetadata.__module__}.{_ProMetadata.__name__}")
@@ -185,8 +180,6 @@ class _PyPTOProIndexerTND(torch.autograd.Function):
 
 class PyPTOProInnerIndexer(InnerIndexer):
     """Standalone selector over compile-safe, lazily loaded PyPTO-Pro kernels."""
-
-    requires_teacher = True
 
     @dataclass(kw_only=True, slots=True)
     class Config(InnerIndexer.Config):

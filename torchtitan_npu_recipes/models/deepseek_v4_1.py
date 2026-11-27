@@ -5,8 +5,6 @@
 
 """Public DeepSeek V4.1 training recipes."""
 
-from dataclasses import replace
-
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.data import (
     ConcatThenSplitPackingConfig,
@@ -127,7 +125,7 @@ def deepseek_v4_1_flash_sft_4k_a5() -> TrainerEx.Config:
 
 
 def deepseek_v4_1_flash_cpt_1m_a5() -> TrainerEx.Config:
-    """Declare the long-context CP configuration; the model still rejects unsupported CP."""
+    """Build BF16 Flash CPT with full activation recomputation and CP128."""
     parallelism = ParallelismConfig(
         data_parallel_shard_degree=1,
         data_parallel_replicate_degree=1,
@@ -138,18 +136,12 @@ def deepseek_v4_1_flash_cpt_1m_a5() -> TrainerEx.Config:
         fsdp_reshard_after_forward="always",
         enable_sequence_parallel=True,
     )
-    # TorchTitan validates the CP inner-attention types while the model config is
-    # constructed, and the v0.4 CP lifecycle is not migrated yet. Assemble the
-    # declaration on the CP=1 skeleton, then carry the requested topology on the
-    # trainer config; parallelize rejects it through
-    # ``validate_deepseek_v4_1_parallelism``.
     config = _make_trainer_config(
         "deepseek_v4_1_flash_text",
-        parallelism=replace(parallelism, context_parallel_degree=1),
+        parallelism=parallelism,
         seq_len=1048576,
         engram_enabled=False,
     )
-    config.parallelism = parallelism
     config.training.num_tokens_per_train_step = 1048576
     config.debug.print_config = True
     assert isinstance(config.dataloader, GrainDataLoader.Config)
@@ -160,6 +152,5 @@ def deepseek_v4_1_flash_cpt_1m_a5() -> TrainerEx.Config:
     assert isinstance(dataset.source, HuggingFaceRandomAccessSource.Config)
     assert isinstance(dataset.processor, AlignedTextProcessor.Config)
     dataset.source.load_dataset_kwargs["data_files"] = _DEFAULT_TEXT_DATA_FILES
-    dataset.processor.per_doc_alignment = 256
     config.override.imports = _flash_overrides(a5=True, fused_attention=True, vision_rope=False)
     return config

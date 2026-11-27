@@ -20,9 +20,10 @@ and SMLAG's backward emits the teacher on the selector's ``topk_scores`` edge.
 All AscendC metadata is precomputed at the backend's own metadata boundary and
 carried in the registered ``AscV4Metadata``, so this module never builds or
 caches metadata per layer; because the records describe *frames*, the CP
-transform rebuilds them for this rank (``prepare_cp_metadata``).  The CP path's
-``S(1) -> R`` sharding gathers the KV streams to the whole row at the wrapper
-boundary, and the frames' ``seqused`` limits each rank's view.  Every fused
+backend builds the records from rank-local frames.
+The CP path gathers the compressed key stream to the whole row at the wrapper
+boundary and exchanges only the sliding window's missing tokens, and the frames'
+``seqused`` limits each rank's view.  Every fused
 kernel of arch22, however, anchors its mask at the *end* of the key frame it is
 given (it reads no ``seqused`` there), so on that SoC the options state the reach
 itself as the frame and the wrapper compacts both gathered rows onto it before the
@@ -37,7 +38,6 @@ the sink is fp32 — an eager-fp32 caller fails loudly at the kernel's dtype
 check.
 """
 
-from collections.abc import Mapping
 from dataclasses import dataclass, replace
 
 import spmd_types as spmd
@@ -49,7 +49,6 @@ from cann_ops_transformer import (
     sparse_lightning_indexer_kl_loss_grad_metadata,
 )
 from torchtitan.models.common.attention import create_varlen_metadata_for_document
-from torchtitan.models.common.attention.cp_attention import CPInnerAttention
 from torchtitan.models.deepseek_v4.compressor import SparseIndexerLoss
 
 from torchtitan_npu.models.common.metadata import KernelFrame
@@ -87,8 +86,7 @@ _CMP_MASK_MODE = 3
 # keeping the model-dir metadata NPU-free.  Those kernels take only shape
 # information, so their results are layer-invariant and reused by every DSA
 # layer and by the backward pass.  ``AscCompressedSparseInnerAttention.Config``
-# builds the whole thing (upstream #4897); because a record describes the frames
-# it was derived from, ``prepare_cp_metadata`` rebuilds them per rank.
+# builds the records for the frames selected by the backend.
 
 
 def _selector_records(
@@ -198,7 +196,6 @@ def build_aicpu_metadata(
     metadata: DeepSeekV4Metadata,
     *,
     geometry: AicpuGeometry,
-    include_selector: bool = True,
 ) -> AscV4Metadata:
     """The AscendC record tier over one geometry's frames (upstream #4897).
 
@@ -225,7 +222,7 @@ def build_aicpu_metadata(
     workaround = None
     if not _IS_A5:
         workaround, swa_k, cmp_k = A3KeyWorkaround.build(swa_k=swa_k, cmp_k=cmp_k)
-    li_record, slig_metadata = _selector_records(q, cmp_k, geometry, ratio) if include_selector else (None, None)
+    li_record, slig_metadata = _selector_records(q, cmp_k, geometry, ratio)
     smla_metadata, smla_grad_metadata = _sparse_attention_records(q, swa_k, cmp_k, geometry, ratio)
     record = AicpuMetadata(
         geometry=geometry,
@@ -240,7 +237,6 @@ def build_aicpu_metadata(
         position_k=metadata.position_k,
         batch_size=metadata.batch_size,
         slots=metadata.slots,
-        cp=metadata.cp,
         aicpu_metadata=record,
         a3_workaround=workaround,
     )
@@ -264,11 +260,6 @@ def _mark_dynamic(metadata: AscV4Metadata) -> None:
         workaround = metadata.a3_workaround
         assert workaround is not None, "an arch22 entry states the key workaround"
         tensors += [gather for gather in (workaround.swa_k_gather, workaround.cmp_k_gather) if gather is not None]
-    if metadata.cp is not None:
-        # The restore's scatter table moves with the slab width and the batch's document layout;
-        # ``position_k`` is the geometry's own field and is marked here with the rest of the
-        # tensors whose first dimension follows the batch.
-        tensors += [metadata.position_k, metadata.cp.restore.exchange.send_index]
     if metadata.aicpu_metadata.lightning_indexer.fwd is not None:
         tensors.append(metadata.aicpu_metadata.lightning_indexer.fwd)
     for tensor in tensors:
@@ -367,7 +358,6 @@ class AscSparseMLAMixin:
     training: bool
     softmax_scale: float
     aux_loss: SparseIndexerLoss | None
-    uses_fused_indexer = True
 
     def forward(
         self,
@@ -384,7 +374,7 @@ class AscSparseMLAMixin:
         denominator,
         padding_mask_T,
     ):
-        aux_loss = self.aux_loss if self.training and self.uses_fused_indexer else None
+        aux_loss = self.aux_loss if self.training else None
         scores = None
         if aux_loss is not None:
             if denominator is None:
@@ -442,11 +432,10 @@ class AscCompressedSparseInnerAttention(AscSparseMLAMixin, CompressedSparseInner
         """The selector geometry its record and SLIKG backward are sized with."""
 
         aux_loss: SparseIndexerLoss.Config | None = None
-        uses_fused_indexer: bool = True
 
         @property
         def attention_metadata_key(self):
-            return (type(self), self.compress_ratio, self.uses_fused_indexer)
+            return (type(self), self.compress_ratio)
 
         @property
         def geometry(self) -> AicpuGeometry:
@@ -484,7 +473,7 @@ class AscCompressedSparseInnerAttention(AscSparseMLAMixin, CompressedSparseInner
             with spmd.no_typecheck():
                 cu = torch.unique_consecutive(documents.cu_seq_q)
             row = build_v4_metadata(positions, self.compress_ratio, cu_seq_q=cu, build_slots=False)
-            fused = build_aicpu_metadata(row, geometry=self.geometry, include_selector=self.uses_fused_indexer)
+            fused = build_aicpu_metadata(row, geometry=self.geometry)
             return replace(fused, documents=documents)
 
     def __init__(self, config: Config) -> None:
@@ -494,13 +483,10 @@ class AscCompressedSparseInnerAttention(AscSparseMLAMixin, CompressedSparseInner
         self.index_num_heads = config.index_num_heads
         self.index_head_dim = config.index_head_dim
         self.aux_loss = config.aux_loss.build() if config.aux_loss is not None else None
-        self.uses_fused_indexer = config.uses_fused_indexer
 
     def _parallelize(self, parallelism_context):
         if parallelism_context.get_optional_mesh("tp") is not None:
             raise NotImplementedError("DeepSeek-V4 SMLA requires TP=1.")
-        if parallelism_context.get_optional_mesh("cp") is not None and not isinstance(self, CPInnerAttention):
-            raise NotImplementedError("DeepSeek-V4 SMLA requires a CPInnerAttention backend for CP>1.")
         super()._parallelize(parallelism_context)
 
     def forward(  # pyrefly: ignore [bad-override]
@@ -532,13 +518,13 @@ class AscCompressedSparseInnerAttention(AscSparseMLAMixin, CompressedSparseInner
                 window_size=self.window_size,
             )
             has_pool = attention_metadata.cmp_k is not None
-            output, lse = super().forward(
+            output, _ = super().forward(
                 q,
                 swa_k,
                 attn_sink,
                 cmp_k=cmp_k if has_pool else None,
                 topk_indices=indices if has_pool else None,
-                topk_scores=topk_scores if self.uses_fused_indexer else None,
+                topk_scores=topk_scores,
                 attention_metadata=attention_metadata,
                 options=options,
                 compact_keys=not _IS_A5,
@@ -546,50 +532,6 @@ class AscCompressedSparseInnerAttention(AscSparseMLAMixin, CompressedSparseInner
                 padding_mask_T=padding_mask_T,
             )
             output = output.reshape(q.shape[0], *output.shape[1:])
-            if self.training and self.aux_loss is not None and not self.uses_fused_indexer:
-                assert cmp_k is not None and topk_indices is not None and topk_scores is not None
-                if aux_loss_denominator is None:
-                    raise RuntimeError("SparseIndexerLoss requires aux_loss_denominator.")
-                output = self.aux_loss(
-                    q.detach(),
-                    cmp_k.detach(),
-                    topk_indices,
-                    topk_scores,
-                    lse.squeeze(0).detach(),
-                    attention_metadata.cu_seq_q,
-                    carrier=output,
-                    denominator=aux_loss_denominator,
-                    padding_mask_T=padding_mask_T,
-                )
         if spmd.is_type_checking():
             spmd.assert_type(output, spmd.get_local_type(q), spmd.get_partition_spec(q))
         return output
-
-
-class AscV4ContextParallelSparseAttention(CPInnerAttention, AscCompressedSparseInnerAttention):
-    """The fused TND backend with its document-chunk CP metadata protocol.
-
-    Forward keeps the existing rank-local query/global key contract: the
-    attention wrapper restores the KV stream, and the fused metadata owns
-    each rank's query frame and key reach. This class selects that existing
-    implementation through TorchTitan's typed CP configuration interface.
-    """
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(CPInnerAttention.Config, AscCompressedSparseInnerAttention.Config):
-        # Released Flash geometry, also used by the ordinary asc entry.
-        num_heads: int = 64
-        head_dim: int = 512
-        index_num_heads: int = 64
-        index_head_dim: int = 128
-
-    @staticmethod
-    def prepare_cp_metadata(attention_metadata, *, permutation):
-        if isinstance(attention_metadata, Mapping):
-            return {
-                key: AscV4ContextParallelSparseAttention.prepare_cp_metadata(value, permutation=permutation)
-                for key, value in attention_metadata.items()
-            }
-        if not isinstance(attention_metadata, AscV4Metadata):
-            raise TypeError("V4 context parallel attention requires AscV4Metadata")
-        return type(attention_metadata).prepare_cp_metadata(attention_metadata, permutation=permutation)

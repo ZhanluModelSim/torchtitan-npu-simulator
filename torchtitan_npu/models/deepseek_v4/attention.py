@@ -105,13 +105,7 @@ class Attention(v4_attention.DeepSeekV4Attention):
         super().__init__(config)
         backend = config.inner_attention
         if config.indexer is not None:
-            inner_indexer = self.indexer.inner_indexer
-            inner_indexer.return_scores = backend.aux_loss is not None
-            if hasattr(backend, "uses_fused_indexer"):
-                backend.uses_fused_indexer = inner_indexer.requires_teacher  # pyrefly: ignore [missing-attribute]
-                self.inner_attention.uses_fused_indexer = inner_indexer.requires_teacher
-            elif inner_indexer.requires_teacher and inner_indexer.return_scores:
-                raise ValueError("Fused indexer training requires a sparse attention backend that emits its teacher.")
+            self.indexer.inner_indexer.return_scores = backend.aux_loss is not None
         self.attention_metadata_key = getattr(backend, "attention_metadata_key", type(self.inner_attention))
         self.q_b_norm = config.q_b_norm.build()
 
@@ -184,20 +178,18 @@ class Attention(v4_attention.DeepSeekV4Attention):
         q = torch.cat([q_nope, q_rope], dim=-1)
         kv = torch.cat([kv_nope, kv_rope.squeeze(1)], dim=-1)
 
-        cu_seqlens = _packed_cu_seqlens(attention_metadata)
         cmp_k = topk_indices = topk_scores = None
         if self.compress_ratio > 1 and hasattr(self, "indexer"):
             topk_indices, topk_scores = self.indexer(
                 x.detach(),
                 qr.detach(),
                 positions=positions,
-                cu_seqlens=cu_seqlens,
                 attention_metadata=attention_metadata,
             )
         if self.compress_ratio == 4:
-            cmp_k = self.compressor(x, positions=positions, cu_seqlens=cu_seqlens)
+            cmp_k = self.compressor(x, positions=positions, attention_metadata=attention_metadata)
         elif self.compress_ratio > 1:
-            cmp_k = self.compressor_128(x, positions=positions, cu_seqlens=cu_seqlens)
+            cmp_k = self.compressor_128(x, positions=positions, attention_metadata=attention_metadata)
 
         attn_sink_param = self.attn_sink.weight.squeeze(-1)
         if self.compress_ratio == 4:

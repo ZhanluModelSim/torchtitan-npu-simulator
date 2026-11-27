@@ -114,8 +114,6 @@ class AscInnerIndexer(AscIndexerMixin, InnerIndexer):
     ``topk_scores``' gradient and this backward is what reads it, so training requires both overrides.
     """
 
-    requires_teacher = True
-
     @dataclass(kw_only=True, slots=True)
     class Config(InnerIndexer.Config):
         pass

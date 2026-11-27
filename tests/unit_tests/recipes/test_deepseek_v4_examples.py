@@ -148,16 +148,13 @@ def test_qat_recipe_preserves_inherited_a5_policy_and_adds_mxfp4():
     assert config.training.num_tokens_per_microbatch_per_dp_rank == 8192
 
 
-@pytest.mark.parametrize(
-    "name,message,recipe_module",
-    [
-        ("deepseek_v4_flash_cpt_1024k_a5", "Context parallelism is deferred", None),
-    ],
-    ids=["context-parallel"],
-)
-def test_deferred_examples_report_the_actual_unavailable_capability(name, message, recipe_module):
-    with pytest.raises(NotImplementedError, match=message):
-        _load(name, recipe_module=recipe_module)
+def test_long_context_recipe_uses_bf16_document_cp():
+    config = _load("deepseek_v4_flash_cpt_1024k_a5")
+
+    assert config.parallelism.context_parallel_degree == 128
+    assert config.training.max_context_length == 1048576
+    assert config.dataloader.dataset.dataset.processor.per_doc_alignment == 128 * 128
+    assert not config.extension.quantization.enable_quantized_training
 
 
 @pytest.mark.parametrize(

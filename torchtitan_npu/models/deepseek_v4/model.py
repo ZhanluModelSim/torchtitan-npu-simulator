@@ -46,12 +46,8 @@ class DeepSeekV4Model(GeometryAttentionMetadataMixin, TorchTitanV4Model):
         from torchtitan_npu.models.common.moe import validate_dispatcher_capacity
 
         parallelism = kwargs["parallelism"]
-        if (
-            parallelism.tensor_parallel_degree != 1
-            or parallelism.context_parallel_degree != 1
-            or parallelism.pipeline_parallel_degree != 1
-        ):
-            raise NotImplementedError("The eager upgrade supports TP=CP=PP=1 only.")
+        if parallelism.tensor_parallel_degree != 1 or parallelism.pipeline_parallel_degree != 1:
+            raise NotImplementedError("DeepSeek-V4 eager training requires TP=PP=1.")
         validate_dispatcher_capacity(self.config, training=kwargs["training"], parallelism=parallelism)
         return super().parallelize(**kwargs)
 

@@ -135,8 +135,6 @@ class PyPTOInnerIndexer(InnerIndexer):
     from that port: each runtime keeps its own call site.
     """
 
-    requires_teacher = True
-
     @dataclass(kw_only=True, slots=True)
     class Config(InnerIndexer.Config):
         pass

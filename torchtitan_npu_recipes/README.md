@@ -22,7 +22,7 @@
 | 同上 | `deepseek_v4_flash_qat_4k_a5` | A5 CPT 基础上启用 MXFP4 QAT |
 | 同上 | `deepseek_v4_flash_sft_4k_a3` | 128 卡对话 SFT，允许保存 checkpoint |
 | 同上 | `deepseek_v4_flash_lora_4k_a3` | 128 卡 LoRA，rank 16，PEFT checkpoint |
-| 同上 | `deepseek_v4_flash_cpt_1024k_a5` | 1M 上下文、CP128；待迁移 |
+| 同上 | `deepseek_v4_flash_cpt_1024k_a5` | 1M 上下文、BF16、CP128，见 [上下文并行](../docs/feature_guides/context_parallel.md) |
 | `graph_trainer.deepseek_v4` | `graph_trainer_deepseek_v4_flash_cpt_4k_a5` | 128 卡 A5 图训练、DeepEP、block-FP8；当前配置 schema 不兼容 |
 | `torchft.deepseek_v4` | `deepseek_v4_flash_torchft` | 两个 64 卡 replica，43 层、256 专家，FSDP64/EP64 |
 

@@ -70,7 +70,6 @@ def cpu_world_8p(monkeypatch):
 @pytest.mark.parametrize("enabled", [False, True], ids=["off", "on"])
 def test_parallelize_shards_experts_across_replicas(cpu_world_8p, monkeypatch, tmp_path, family, enabled):
     from torchtitan_npu_recipes.models.deepseek_v4 import _flash_config
-    from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_text
 
     parallelism = _hsdp(enabled=enabled)
 
@@ -84,7 +83,11 @@ def test_parallelize_shards_experts_across_replicas(cpu_world_8p, monkeypatch, t
                 num_mtp_layers=1,
                 hf_assets_path=str(tmp_path),
             )
-        cfg = deepseek_v4_1_debugmodel_text(parallelism=parallelism, hf_assets_path=str(tmp_path))
+        from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import _make_trainer_config
+
+        cfg = _make_trainer_config(
+            "deepseek_v4_1_debugmodel_text", parallelism=parallelism, hf_assets_path=str(tmp_path)
+        )
         cfg.model.layers = cfg.model.layers[:1]
         cfg.model.n_layers = 1
         cfg.model.compress_ratios = cfg.model.compress_ratios[:1]
@@ -163,10 +166,12 @@ def test_rejects_effective_expert_dp_exceeding_num_experts(cpu_world_8p, monkeyp
 @pytest.mark.parametrize("shard_over_efsdp", [False, True], ids=["ep-only", "joint-efsdp"])
 def test_v41_engram_sharding_with_disable_expert_replication(cpu_world_8p, monkeypatch, tmp_path, shard_over_efsdp):
     from torchtitan_npu.models.deepseek_v4_1.engram.host import HostEngramTable
-    from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_text
+    from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import _make_trainer_config
 
     def make_recipe():
-        cfg = deepseek_v4_1_debugmodel_text(parallelism=_hsdp(enabled=True), hf_assets_path=str(tmp_path))
+        cfg = _make_trainer_config(
+            "deepseek_v4_1_debugmodel_text", parallelism=_hsdp(enabled=True), hf_assets_path=str(tmp_path)
+        )
         engram_layer = next(layer for layer in cfg.model.layers if layer.engram is not None)
         engram_layer.engram.table.shard_over_efsdp = shard_over_efsdp
         cfg.model.layers = [engram_layer]

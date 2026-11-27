@@ -305,7 +305,6 @@ def test_module_swap_installs_and_restores_the_v41_selector_forward(monkeypatch)
             return "original", args, kwargs
 
     host = SelectorHost()
-    host.requires_teacher = False
     original_forward = host.forward
     captured = {}
 
@@ -318,13 +317,11 @@ def test_module_swap_installs_and_restores_the_v41_selector_forward(monkeypatch)
     operands = tuple(object() for _ in range(4))
     candidate = object()
 
-    assert host.requires_teacher
     assert host(*operands, candidates_BL1C=candidate) == "quantized"
     assert captured == {"self": host, "args": operands, "candidate": candidate}
 
     _quant_v41_lightning_indexer_transform(host, DeepSeekV41QuantLightningIndexerConfig(step=QATStep.CONVERT))
     result = host(*operands, candidates_BL1C=candidate)
 
-    assert not host.requires_teacher
     assert result[0] == "original"
-    assert host._torchao_npu_original_forward == original_forward
+    assert host.forward == original_forward

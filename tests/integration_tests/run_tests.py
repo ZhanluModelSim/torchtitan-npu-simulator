@@ -25,6 +25,7 @@ from pathlib import Path
 
 # torchtitan-npu override: the runner consumes the case definition at runtime.
 from tests.integration_tests import OverrideDefinitions  # noqa: TC001
+from tests.integration_tests.deepseek_cp import build_deepseek_cp_test_list
 from tests.integration_tests.deepseek_v4 import (
     build_deepseek_v4_checkpoint_resume_test_list,
     build_deepseek_v4_quantized_test_list,
@@ -81,6 +82,7 @@ def build_engram_hf_test_list():
 # torchtitan-npu override: register the DeepSeek-V4 and V4.1 NPU suites.
 _TEST_SUITES_FUNCTION = {
     "models": build_models_test_list,
+    "deepseek_cp": build_deepseek_cp_test_list,
     "deepseek_v4": build_deepseek_v4_test_list,
     "deepseek_v4_1": build_deepseek_v4_1_test_list,
     "deepseek_v4_1_graph_engram": build_deepseek_v4_1_graph_engram_test_list,

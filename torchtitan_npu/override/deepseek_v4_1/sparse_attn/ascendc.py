@@ -4,22 +4,13 @@
 # LICENSE file in the root directory of this source tree.
 """V4.1 SMLA attention and SMLAG-backed indexer distillation."""
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 
 import cann_ops_transformer  # noqa: F401  (registers the fused operators)
 import torch
 from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
-from torchtitan.models.common.attention.cp_attention import CPInnerAttention
 
-from torchtitan_npu.models.common.alignment import require_document_alignment
 from torchtitan_npu.models.common.metadata import KernelFrame
-from torchtitan_npu.models.common.restore import (
-    DOC_CHUNK_LAYOUT,
-    RestorePlan,
-    chunk_plan,
-    slab_positions,
-)
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Metadata
 from torchtitan_npu.override import _IS_A5
@@ -34,7 +25,6 @@ from torchtitan_npu.override.deepseek_v4_1.metadata import (
     AscLightningIndexerMetadata,
     AscSparseAttentionMetadata,
 )
-from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_shard_context
 
 
 def validate_compressed_frame(ratio: int, cmp_k: KernelFrame | None) -> None:
@@ -145,40 +135,6 @@ class AscV41Metadata(DeepSeekV41Metadata):
     per layer.
     """
 
-    @staticmethod
-    def prepare_cp_metadata(  # pyrefly: ignore [bad-override]
-        # The seam dispatches on ``type(metadata)``, so this hook's contract is its own class;
-        # widening the parameter would accept a plain row and lose this geometry's ratio.
-        attention_metadata: "AscV41Metadata",
-        *,
-        permutation: torch.Tensor | None,
-    ) -> "AscV41Metadata":
-        """This rank's frames and metadata (upstream #4617's CP half), for one geometry.
-
-        The row and the rank come from the shard context, because this rank's copy is derived
-        from all of it.  ``permutation`` is unused: the layout is stated by the frames themselves
-        (chunk ``r`` of every document), and the context says which layout the shard applied --
-        the two must be the same one, so a run sharded any other way is refused here.
-        """
-        del permutation
-        context = cp_shard_context()
-        if context.cp_mesh is None or context.positions is None:
-            raise ValueError("prepare_cp_metadata needs the CP mesh and the pre-shard positions")
-        if context.load_balancer_type != DOC_CHUNK_LAYOUT:
-            raise ValueError(
-                "the V4.1 fused stack's rank-local frames describe the doc-chunk layout, but the "
-                f"context-parallel load balancer is {context.load_balancer_type!r}: run with "
-                f"--parallelism.context-parallel-load-balancer {DOC_CHUNK_LAYOUT}."
-            )
-        batch_size, row_len = 1, context.positions.shape[0]
-        return shard_asc_v41_metadata(
-            attention_metadata,
-            cp_size=context.cp_mesh.size(),
-            cp_rank=context.cp_mesh.get_local_rank(),
-            batch_size=batch_size,
-            slab_len=row_len // context.cp_mesh.size(),
-        )
-
 
 # The registration is asymmetric on purpose, and reserved: DSV4 registers its whole masks object
 # because the graph_trainer's ``minimal_fx_tracer`` requires ``attention_masks`` to flatten into
@@ -223,84 +179,6 @@ def build_fused_metadata(row: DeepSeekV41Metadata, *, ratio: int, geometry: Aicp
         cu_seq_q=cu_seqlens,
         cu_seq_k=row.cu_seq_k,
         position_k=row.position_k,
-        restore=row.restore,
-        ratio=ratio,
-        q=q,
-        swa_k=swa_k,
-        cmp_k=cmp_k,
-        aicpu_metadata=record,
-        a3_workaround=workaround,
-    )
-
-
-def shard_asc_v41_metadata(
-    attention_metadata: AscV41Metadata,
-    *,
-    cp_size: int,
-    cp_rank: int,
-    batch_size: int,
-    slab_len: int,
-) -> AscV41Metadata:
-    """One rank's frames and metadata: the row's grid re-cut into this rank's chunks.
-
-    The queries are chunk ``cp_rank`` of every document while the KV streams stay the **whole
-    row** -- gathered declaratively at the AscendC attention's boundary -- so the KV frames'
-    ``cu_seqlens`` address that row and their ``seqused = K_d = (cp_rank + 1) * Q_d`` is how far
-    these queries reach into each document.  That is what keeps the kernels' end-aligned window
-    and causal limit anchored at this rank's chunk rather than at the row's end.
-
-    The metadata is rebuilt from the rank-local frames: the metadata is the operators'
-    answer for one geometry *of one frame set*, so a rank that kept the global ones would hand
-    the kernels a grid its inputs do not have.  ``slab_len`` is the **slab** width -- the shape of
-    the inputs this rank holds, not of the row.
-    """
-    cu_seqlens = attention_metadata.cu_seq_q
-    ratio = attention_metadata.ratio
-    seqused = torch.diff(cu_seqlens).to(torch.int32)
-    # Every document must be a whole multiple of ``cp_size * ratio``: the first factor makes
-    # every prefix a whole number of chunks, the second keeps every compressed prefix a whole
-    # number of groups.  The stack-wide lcm is the dataloader's business
-    # (``compression_alignment``); each geometry enforces its own factor here, and together the
-    # entries of a stack are the same constraint.
-    # This check subsumes ``validate_compressed_frame``: a document that is a whole multiple of
-    # ``cp_size * ratio`` leaves no partial group either, and the build that produced this entry
-    # already ran that check at ``cp_size = 1``.
-    require_document_alignment(cu_seqlens, cp_size=cp_size, ratio=ratio)
-    chunk = (seqused // cp_size).to(torch.int32)
-    # The slab is what the chunk grid has to reproduce: the row is cut into ``cp_size`` slabs and
-    # the chunks are this rank's share of every document, so the two must size the same.
-    if int(chunk.sum()) != batch_size * slab_len:
-        raise ValueError(
-            f"the sliced rows ({batch_size * slab_len}) are not the chunks' total "
-            f"({int(chunk.sum())}): the boundaries describe a different row than the one the "
-            "inputs were sliced from."
-        )
-    reach = ((cp_rank + 1) * chunk).to(torch.int32)
-    restore = RestorePlan(exchange=chunk_plan(cu_seqlens, cp_size, cp_rank, slab_len))
-    q = KernelFrame(cu_seqlens=(cu_seqlens // cp_size).to(torch.int32), seqused=chunk)
-    swa_k = KernelFrame(cu_seqlens=cu_seqlens, seqused=reach)
-    cmp_k = None
-    if ratio > 0:
-        cmp_k = KernelFrame(
-            cu_seqlens=attention_metadata.cu_seq_k,
-            seqused=(reach // ratio).to(torch.int32),
-            residual=None if ratio == 1 else (reach % ratio).to(torch.int32),
-        )
-    workaround = None
-    if not _IS_A5:
-        workaround, swa_k, cmp_k = A3KeyWorkaround.build(swa_k=swa_k, cmp_k=cmp_k)
-    record = build_aicpu_metadata(
-        ratio=ratio,
-        q=q,
-        swa_k=swa_k,
-        cmp_k=cmp_k,
-        geometry=attention_metadata.aicpu_metadata.geometry,
-    )
-    return AscV41Metadata(
-        cu_seq_q=cu_seqlens,
-        cu_seq_k=attention_metadata.cu_seq_k,
-        position_k=slab_positions(cu_seqlens, cp_size, cp_rank, slab_len).squeeze(0),
-        restore=restore,
         ratio=ratio,
         q=q,
         swa_k=swa_k,
@@ -443,7 +321,7 @@ class AscV41SparseAttention(AscSparseMLAMixin, CompressedSparseInnerAttention2):
             the reference backend's builder, so both cores grid one set of boundaries.  The
             metadata is the AI_CPU operators' answer for that geometry, computed here at the
             eager boundary instead of per layer inside the compiled region, and rebuilt per rank
-            by ``prepare_cp_metadata``.
+            by the context-parallel transform.
             """
             # The parent builder is named explicitly: ``slots=True`` recreates this dataclass, so
             # a zero-argument ``super()`` would bind to the decorated-away class and raise.
@@ -474,7 +352,7 @@ class AscV41SparseAttention(AscSparseMLAMixin, CompressedSparseInnerAttention2):
     ):
         if (cmp_k is None) != (topk_indices is None):
             raise ValueError("cmp_k and topk_indices must be provided together")
-        output, lse = super().forward(
+        output, _ = super().forward(
             q,
             swa_k,
             attn_sink,
@@ -487,48 +365,4 @@ class AscV41SparseAttention(AscSparseMLAMixin, CompressedSparseInnerAttention2):
             denominator=aux_loss_denominator,
             padding_mask_T=padding_mask_T,
         )
-        output = output.reshape_as(q)
-        if self.training and self.aux_loss is not None and not self.uses_fused_indexer:
-            if aux_loss_denominator is None:
-                raise RuntimeError("SparseIndexerLoss requires aux_loss_denominator.")
-            assert cmp_k is not None and topk_indices is not None and topk_scores is not None
-            output = self.aux_loss(
-                q.detach(),
-                cmp_k.detach(),
-                topk_indices,
-                topk_scores,
-                lse.squeeze(0).detach(),
-                attention_metadata.cu_seq_q,
-                carrier=output,
-                denominator=aux_loss_denominator,
-                padding_mask_T=padding_mask_T,
-            )
-        return output
-
-
-class AscV41ContextParallelSparseAttention(CPInnerAttention, AscV41SparseAttention):
-    """The fused V4.1 TND backend and its rank-local metadata preparation.
-
-    The inherited forward consumes local queries and the restored KV stream.
-    AscV41Metadata prepares per-document query chunks, global key reach,
-    restore plans and the corresponding kernel records.
-    """
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(CPInnerAttention.Config, AscV41SparseAttention.Config):
-        num_heads: int = 64
-        head_dim: int = 512
-        index_topk: int = 512
-        index_num_heads: int = 32
-        index_head_dim: int = 128
-
-    @staticmethod
-    def prepare_cp_metadata(attention_metadata, *, permutation):
-        if isinstance(attention_metadata, Mapping):
-            return {
-                key: AscV41ContextParallelSparseAttention.prepare_cp_metadata(value, permutation=permutation)
-                for key, value in attention_metadata.items()
-            }
-        if not isinstance(attention_metadata, AscV41Metadata):
-            raise TypeError("V4.1 context parallel attention requires AscV41Metadata")
-        return AscV41Metadata.prepare_cp_metadata(attention_metadata, permutation=permutation)
+        return output.reshape_as(q)

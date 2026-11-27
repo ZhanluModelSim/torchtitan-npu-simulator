@@ -16,9 +16,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from torchtitan.models.deepseek_v4 import compressor as v4_compressor
 
 from torchtitan_npu.ops.ascendc.compressor import load_compressor
+
+from ..context_parallel import CPCompressor
 
 
 def _state_inputs(
@@ -46,7 +47,7 @@ def _state_inputs(
     return state_block_table, state_cache, cu_seqlens, seqused
 
 
-class AscCompressor(v4_compressor.Compressor):
+class AscCompressor(CPCompressor):
     """Fuse complete packed groups while retaining the upstream compressor layout.
 
     CANN emits partial groups, whereas upstream packs only complete groups and
@@ -56,7 +57,7 @@ class AscCompressor(v4_compressor.Compressor):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(v4_compressor.Compressor.Config):
+    class Config(CPCompressor.Config):
         fused_pooling: bool = True
 
     def __init__(self, config: Config):
@@ -64,16 +65,16 @@ class AscCompressor(v4_compressor.Compressor):
         self.fused_pooling = config.fused_pooling
         self._compressor_fn = None
 
-    def forward(self, x, positions, cu_seqlens=None):
+    def _compress(self, x, positions, cu_seqlens):
         if not self.fused_pooling:
-            return super().forward(x, positions, cu_seqlens)
+            return super()._compress(x, positions, cu_seqlens)
         ratio = self.compress_ratio
         seqlen = x.shape[0]
         if seqlen == 0:
-            return super().forward(x, positions, cu_seqlens)
+            return super()._compress(x, positions, cu_seqlens)
         if cu_seqlens is None:
             if seqlen % ratio:
-                return super().forward(x, positions, cu_seqlens)
+                return super()._compress(x, positions, cu_seqlens)
             cu_seqlens = torch.tensor([0, seqlen], dtype=torch.int32, device=x.device)
         else:
             native_cu_seqlens = cu_seqlens
@@ -85,7 +86,7 @@ class AscCompressor(v4_compressor.Compressor):
             cu_seqlens = cu_seqlens[indices <= end_index]
             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
             if not bool(((lengths > 0) & (lengths % ratio == 0)).all()):
-                return super().forward(x, positions, native_cu_seqlens)
+                return super()._compress(x, positions, native_cu_seqlens)
 
         state_block_table, state_cache, cu_seqlens, seqused = _state_inputs(
             cu_seqlens,

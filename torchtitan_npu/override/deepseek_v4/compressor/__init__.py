@@ -31,7 +31,6 @@ def _fuse_compressor_norm(norm: "Module.Config") -> "Module.Config":
 
 @override(
     target=Compressor.Config,
-    exact=True,
     description="Use CANN compression with the upstream DeepSeek-V4 component contract",
 )
 def asc(

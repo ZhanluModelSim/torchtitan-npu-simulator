@@ -192,8 +192,6 @@ class QuantV41SparseAttention(torch.nn.Module):
     module-swap handler binds this forward method to it.
     """
 
-    uses_fused_indexer = True
-
     def __init__(
         self, *, window_size: int, softmax_scale: float, compress_ratio: int, aux_loss=None, scale_fused_teacher=None
     ):
@@ -220,21 +218,19 @@ class QuantV41SparseAttention(torch.nn.Module):
         if (cmp_k is None) != (topk_indices is None):
             raise ValueError("cmp_k and topk_indices must be provided together")
         aux_loss = self.aux_loss if self.training and cmp_k is not None else None
-        fused_loss = aux_loss if self.uses_fused_indexer else None
-        if aux_loss is not None and aux_loss_denominator is None:
-            raise RuntimeError("Indexer loss requires aux_loss_denominator.")
-        if aux_loss is not None and topk_scores is None:
-            raise ValueError("QuantV41SparseAttention requires topk_scores for its indexer loss")
         teacher_scores = None
-        if fused_loss is not None:
+        if aux_loss is not None:
+            if aux_loss_denominator is None:
+                raise RuntimeError("Indexer loss requires aux_loss_denominator.")
+            if topk_scores is None:
+                raise ValueError("QuantV41SparseAttention requires topk_scores for its indexer loss")
             if self.scale_fused_teacher is None:
                 raise RuntimeError("Quantized sparse attention requires the host's fused teacher adapter.")
-            assert topk_scores is not None
             teacher_scores = topk_scores.reshape(-1, 1, topk_scores.shape[-1])
         q_tnd = q.reshape(-1, *q.shape[-2:])
         cmp_sd = None if cmp_k is None else cmp_k.reshape(-1, cmp_k.shape[-1])
 
-        output, lse = _SparseMLA.apply(
+        output, _ = _SparseMLA.apply(
             q_tnd,
             swa_k.reshape(-1, 1, swa_k.shape[-1]),
             None if cmp_sd is None else cmp_sd.unsqueeze(1),
@@ -245,22 +241,9 @@ class QuantV41SparseAttention(torch.nn.Module):
             self.compress_ratio,
             self.window_size,
             teacher_scores,
-            fused_loss,
-            self.scale_fused_teacher if fused_loss is not None else None,
+            aux_loss,
+            self.scale_fused_teacher if aux_loss is not None else None,
             aux_loss_denominator,
             padding_mask_T,
         )
-        if aux_loss is not None and not self.uses_fused_indexer:
-            assert cmp_sd is not None and topk_indices is not None and topk_scores is not None
-            output = aux_loss(
-                q_tnd.detach(),
-                cmp_sd.detach(),
-                topk_indices.reshape(q_tnd.shape[0], -1),
-                topk_scores.reshape(q_tnd.shape[0], -1),
-                lse.reshape(q_tnd.shape[:2]).detach(),
-                attention_metadata.cu_seq_q,
-                carrier=output,
-                denominator=aux_loss_denominator,
-                padding_mask_T=padding_mask_T,
-            )
         return output.reshape_as(q)

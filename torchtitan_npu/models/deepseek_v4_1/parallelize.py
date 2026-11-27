@@ -41,15 +41,21 @@ from .engram.host import HostEngramTable
 from .model import DeepSeekV41MultimodalModel
 
 
-def validate_deepseek_v4_1_parallelism(config, *, training: TrainingConfig | None, parallelism):
+def validate_deepseek_v4_1_parallelism(
+    config, *, training: TrainingConfig | None, parallelism, allow_context_parallel: bool = True
+):
     from torchtitan_npu.models.common.moe import validate_dispatcher_capacity
 
     if (
         parallelism.tensor_parallel_degree != 1
-        or parallelism.context_parallel_degree != 1
         or parallelism.pipeline_parallel_degree != 1
+        or (not allow_context_parallel and parallelism.context_parallel_degree != 1)
     ):
-        raise NotImplementedError("DeepSeek V4.1 currently supports TP=CP=PP=1 only")
+        if not allow_context_parallel:
+            raise NotImplementedError("DeepSeek-V4.1 GraphTrainer requires TP=CP=PP=1.")
+        raise NotImplementedError("DeepSeek-V4.1 eager training requires TP=PP=1.")
+    if parallelism.context_parallel_degree > 1 and isinstance(config, DeepSeekV41MultimodalModel.Config):
+        raise NotImplementedError("DeepSeek-V4.1 multimodal training requires CP=1.")
     for layer in config.layers:
         if layer.engram is not None and layer.engram.table.num_embeddings % parallelism.expert_parallel_degree:
             raise ValueError("Engram physical table size must be divisible by EP degree")
@@ -143,7 +149,9 @@ def _chunk_v41_moe_forward(forward, fqn: str):
 def parallelize_graph_trainer_deepseek_v4_1(
     model, *, parallelism_context, training, parallelism, compile_config, activation_remat, dump_folder
 ):
-    validate_deepseek_v4_1_parallelism(model.config, training=training, parallelism=parallelism)
+    validate_deepseek_v4_1_parallelism(
+        model.config, training=training, parallelism=parallelism, allow_context_parallel=False
+    )
     for module in model.modules():
         if isinstance(module, HostEngramTable):
             module.validate_graph_training()

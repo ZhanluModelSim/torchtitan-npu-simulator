@@ -328,7 +328,7 @@ extension `CheckpointManager`（`torchtitan_npu/extensions/torchtitan/components
 | `lightning_indexer.asc` | `InnerIndexer.Config`（精确匹配） | `AscInnerIndexer.Config` | CANN LI 选分与 SLIKG 反向，通过 `topk_scores.grad` 接收 teacher |
 | `lightning_indexer.pypto` | `InnerIndexer.Config`（精确匹配） | `PyPTOInnerIndexer.Config` | PyPTO 的 LI 与 SLIKG，需要与 CANN 匹配的 `pypto` runtime |
 | `lightning_indexer.pypto_pro` | `InnerIndexer.Config`（精确匹配） | `PyPTOProInnerIndexer.Config` | PyPTO-Pro 的 LI 与 SLIKG，依赖 `pypto_pro` runtime；预处理时按几何校验 query/key 的累计边界与有效长度，每个文档均须紧凑 |
-| `compressor.asc` | `Compressor.Config`（精确匹配） | `AscCompressor.Config` | 按 upstream 组件契约使用 CANN 压缩；`fused_norm` / `fused_rope` / `fused_pooling` 可分别关闭 |
+| `compressor.asc` | `Compressor.Config`（含 CP 子类） | `AscCompressor.Config` | 按 upstream 组件契约使用 CANN 压缩；`fused_norm` / `fused_rope` / `fused_pooling` 可分别关闭 |
 | `mhc.asc_hc_pre` | `HcPre.Config` | `AscHcPre.Config` | 使用 `torch_npu.npu_mhc_pre` + `torch_npu.npu_mhc_sinkhorn` |
 | `mhc.tilelang_hc_pre` | `HcPre.Config` | `TilelangHcPre.Config` | 使用外部 TileKernels Split/Apply 与 `torch_npu.npu_mhc_sinkhorn` |
 | `mhc.asc_hc_post` | `HcPost.Config` | `AscHcPost.Config` | 使用 `cann_ops_transformer.ops.mhc_post` |
@@ -355,8 +355,8 @@ recipe 都不需要重复它。`window_size` 与 `index_topk` 不在这里：它
 
 CSA 层的 `attention.indexer` 计算查询、压缩键和权重，交给 `indexer.inner_indexer` 选择文档内的槽位。
 `attention.inner_attention` 接收返回的 `(topk_indices, topk_scores)`。要使用融合蒸馏目标，配方同时启用
-`sparse_attn.asc` 和一个 `lightning_indexer` override，并设置 `aux_loss=None`。SMLAG 反向通过
-`topk_scores` 的梯度传递 teacher，SLIKG 用它计算 indexer 的参数梯度。
+`sparse_attn.asc` 和 `lightning_indexer.asc`。SMLAG 反向通过 `topk_scores` 的梯度传递 teacher，
+SLIKG 用它计算 indexer 的参数梯度。融合路径复用 `SparseIndexerLoss(mass_weighted=True)`。
 
 融合 attention 的 `AscCompressedSparseInnerAttention.Config.build_attention_metadata` 按压缩比构建
 每个 microbatch 的文档边界和核记录。投影读取文档偏移，CANN 核读取去掉空段后的
@@ -487,8 +487,8 @@ torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc={"num_heads":8,"head_dim":
   对着模型自己的取值核对（debug flavor 与默认形状不同，因此它的配方必须显式声明）。
 
 每个 `(config 类, compress_ratio)` 是 map 里的一个 entry，所以一个 40 层、三个几何的栈只建三份
-metadata（不是四十份），也不需要任何一层知道整个栈的 ratio 表；CP 下由该 entry 自己的
-`prepare_cp_metadata` 按 rank-local frames 重建。
+metadata（不是四十份），也不需要任何一层知道整个栈的 ratio 表；CP 下由 `context_parallel` 的
+`CPAttention.prepare_cp_metadata` 按 rank-local frames 重建 entry。
 
 #### 量化路径是另一个 backend：它自己建自己的 entry
 
@@ -513,27 +513,19 @@ lightning_indexer
   的 schedule，量化 kernel 读它不是「稍差一点」而是垃圾索引；
 - 没有池（`candidate_topk_blocks <= 0`）时 `fwd` 仍然是量化 QLI 的那份（pool-free 层也要跑 QLI），
   只有 `fwd_sparse` / `sparse_length` 为空；
-- CP：非量化 entry 由 port 的 `prepare_cp_metadata` 按 rank-local frames 重建；量化 entry 目前
-  只支持 CP=1，其余情况显式报错。
+- CP 下，非量化后端直接根据 rank-local frame 构建记录。量化 entry 使用 CP=1。
 
-#### indexer 只在两个 override 同开时学习
+#### 融合 Indexer 训练
 
-`sparse_attn.asc` 与 `lightning_indexer.asc` 各自替换独立的配置节点，但**必须同时启用**：
-配置需保证两者配套；模型构建入口不再检查 teacher 配对。当前模型并行入口仅接受 TP=CP=PP=1。
-
-原因是 indexer 的训练目标只存在于两个 kernel 反向之间：
+使用融合 Indexer 蒸馏时，配方或启动脚本需同时启用配套的 `sparse_attn.asc` 和
+`lightning_indexer.asc`，使两个反向算子对 `topk_scores` 使用同一 teacher 契约。
 
 - `sparse_attn.asc` 的 SMLAG 反向按每个 key 产生 attention 自身的完整 softmax
   边际质量 `p`（窗口 + 选中压缩条目 + sink），写在 `topk_scores` 的梯度上。
 - `lightning_indexer.asc` 的 SLIKG 反向把该梯度当作教师：`dI = Z·Y - p` 由 kernel
   自己施加，据此产出 indexer 的 `q`/`k`/`w` 梯度。
-- `topk_scores` 不参与任务损失，除这条边之外没有任何消费者。只开
-  `lightning_indexer.asc` 时该梯度为 `None`，SLIKG 反向直接返回零梯度，indexer
-  全程拿不到更新。
-- 只开 `sparse_attn.asc` 时 reference selector 会接住这条边，但它把
-  attention 级别的边际质量加到按 head 求和的 indexer logits 上，两侧不是同一个
-  量，得到的训练信号是错的而不是「另一种」。这条组合当前不做修复，由上面的
-  构造期检查拦住，使该路径不可达。
+
+参考训练配方使用参考 Attention 和 Indexer，在前向通过 `SparseIndexerLoss` 计算蒸馏损失。
 
 V4.1 的 `index_source_layers` 都落在 `compress_ratio` 为 1 或 2 的层上，纯窗口层
 不携带 indexer，也不参与这条边。
@@ -543,11 +535,9 @@ V4.1 的 `index_source_layers` 都落在 `compress_ratio` 为 1 或 2 的层上�
 来源写入 `topk_scores` 的梯度：该边被约定为原始 `p`，写入带符号的值会被 SLIKG
 当作教师并翻转 indexer 的梯度方向。
 
-CPU 测试用 eager 替身覆盖这条边：整模型前反向跑通后逐个断言 indexer 参数都有有限
-梯度，并覆盖只开一侧被拒绝、两侧同开可构建
-（`tests/unit_tests/override/deepseek_v4_1/test_lightning_indexer_fused.py`）。替身验证的
-是模型侧的搬运契约，SMLAG、SLIKG 和 LI 算子本身没有在 CPU 上执行过；NPU 上的数值和
-是否真的产生非零梯度仍需在设备上确认。
+CPU 测试使用 eager 替身检查成对启用的配置和 teacher 的梯度传递
+（`tests/unit_tests/override/deepseek_v4_1/test_lightning_indexer_fused.py`）。SMLAG、SLIKG
+和 LI 的算子数值由 NPU 测试验证。
 
 ### Qwen3.5
 

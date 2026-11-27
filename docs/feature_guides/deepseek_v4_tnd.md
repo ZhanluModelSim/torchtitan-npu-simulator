@@ -21,7 +21,7 @@ DeepSeek-V4 配方通过 `config.override.imports` 显式选择算子，不读�
         │      └─ 文档边界。融合后端按压缩比构建 AscV4Metadata
         │
         ├─ Compressor：扁平 ratio 折叠 + softmax gate → 池化键流（上游 `Compressor`）
-        │     按整行文档边界池化、不跨文档；CP 下由内核边界 all-gather 成整行（CP 当前 deferred）
+        │     按整行文档边界池化、不跨文档；CP 下本 rank 只持有本地压缩 chunk，由 CP wrapper 在文档边界 all-gather 成整行
         │
         ├─ CSA 的 indexer.inner_indexer → (topk_indices, topk_scores)
         │
@@ -52,20 +52,20 @@ TND 只存在于 NPU 融合内核的局部计算中，不会成为模型公共�
 参考配方沿用 TorchTitan 的文档边界。融合配方的 `AscCompressedSparseInnerAttention.Config`
 根据 `positions` 和 padding mask 构建 `AscV4Metadata`。其中 `documents` 保留投影需要的完整边界，
 `q`、`swa_k`、`cmp_k` 是供 CANN 内核使用的 frame。相同压缩比的层共享每个 microbatch 的这份记录。
-文档布局和 frame 定义见 [metadata.py](../../torchtitan_npu/models/deepseek_v4/metadata.py)。
+文档布局和 frame 定义见 [metadata.py](../../torchtitan_npu/models/deepseek_v4/metadata.py)。CP 的 rank-local 传输计划与 kernel frame 见 [cp_metadata.py](../../torchtitan_npu/override/deepseek_v4/cp_metadata.py)。
 
 - `ratio`：这个 entry 的压缩比（1、4、128 之一）；每个 consumer 都按它寻址。
-- `q` / `swa_k` / `cmp_k`：V4.1 形态的三个 frame（`cu_seqlens` / `seqused` / `residual`）。CP 下 `q` 是本 rank 的文档 chunk，`swa_k` / `cmp_k` 是整行，`seqused` 是本 rank 的 reach；非 CP 下三者都退化为边界差。没有 `cu_seq_q` / `cu_seq_k` 别名：用哪个 frame 就读哪个网格——行网格 `swa_k.cu_seqlens`、查询网格 `q.cu_seqlens`、压缩网格 `cmp_k.cu_seqlens`，`ratio == 1` 的 key 网格就是 `swa_k.cu_seqlens`。
+- `q` / `swa_k` / `cmp_k`：V4.1 形态的三个 frame（`cu_seqlens` / `seqused` / `residual`）。CP 下 `q` 是本 rank 的文档 chunk；`swa_k` 是本 rank 查询的滑窗（`cu_seqlens` 为逐文档窗口长度、`seqused` 为窗口长度）；`cmp_k` 保留整行压缩网格，`seqused` 是本 rank 的 reach。非 CP 下三者都退化为边界差。没有 `cu_seq_q` / `cu_seq_k` 别名：用哪个 frame 就读哪个网格——查询网格 `q.cu_seqlens`、行压缩网格 `cmp_k.cu_seqlens`，`ratio == 1` 的 key 网格就是 `swa_k.cu_seqlens`。
 - `slots`：无选择器几何（ratio 128）的参考选择，构建 entry 时按整行一次算好；融合路径不读它。
-- `position_k`：key 流自己的文档内位置（纯算术，零通信）。degree=1 时就是输入的 `positions`，CP 下是本 rank slab 的——消费者的 RoPE 读它，不自己推、也不需要知道流被搬过。
-- `cp`（`CPDeepSeekMetadata`）：只有 CP 下存在，带 `restore`（`RestorePlan`：只有 `exchange`），即 KV 侧恢复回 slab 的移动；恢复后流自己的位置由 entry 的 `position_k` 承载。
+- `position_k`：key 流自己的文档内位置（纯算术，零通信）。degree=1 时就是输入的 `positions`；CP 下 entry 由本 rank 的 frame 重建，压缩器从 `DocumentCPMetadata.position_k` 读本 rank slab 的位置，消费者的 RoPE 读它，不自己推。
+- CP 使用 `DocumentCPMetadata` 表达本 rank 的通信计划和 frame。AscendC 从本 rank 的 frame 直接构建记录。
 - `batch_size`：查询 container 的真实 batch 维（构建 entry 时按 `positions.size(0)` 记一次，各 degree 不变；frame 只描述文档，carry 不了行数）。融合注意力在 CP=1 时支持 `local_batch_size > 1`，输入布局按批展平、输出保留 `[B, S]`；CP>1 暂不支持多 batch。参考选择器仍仅支持 MBS1。
 - `aicpu_metadata`（`AscV4Metadata`）：只有融合 entry 才有，按 kernel 分组保存 `sparse_attn.fwd/bwd` 与 `lightning_indexer.fwd/bwd`；模型目录的 `DeepSeekV4Metadata` 不携带这些张量。
 - `a3_workaround`（`AscV4Metadata`，`override/a3_workaround.py`）：arch22 的融合内核按 key frame 的**末端**对齐 mask 且不读 key 侧 `seqused`，所以 reach 只是文档前缀的 rank 要把两路 key 换成 reach 自己写成的帧并压行；两个流各带一个可微 `index_select`。arch35 不建这个字段。
 
 压缩器没有自己的 metadata 字段：输入为 `[B, L, D]`，每行 token 数必须是 `ratio` 的整数倍。公共入口把整批展平成一条 `[1, B * L, D]` 打包流，完成压缩和 RoPE 后还原为 `[B, L // ratio, D]`。每行 positions 从 0 开始，`create_varlen_metadata_for_document` 据此把行首加入整批 `cu_seq_q`，使 ratio-4 的重叠不会跨行借 token。
 
-V4 的 CP 当前尚未支持（见「当前边界」）。原 ratio-4 重叠 carry 的脚手架——`models/common/carry_exchange.py` 的 `CarryExchange` / `CarryStream`，以及本地 `Compressor` 内部的 restore + carry——已随 0.4.0 清理删除，CP 重做后按新契约补充。
+V4 的逐文档 CP 由 `DeepSeekContextParallelTransform` 安装。ratio-4 的重叠池化在恢复压缩输入时交换前一个压缩块。
 
 一个 batch 里可以打包多条序列，所以 `B` 与序列条数无关。例如：
 
@@ -81,10 +81,10 @@ cu_seqlens = [0, 3, 5]   # 一行里打包了 2 条序列
 
 文档在进入行拼接前按 `lcm(compress_ratios)`（V4 为 `128`）对齐：dataloader 在 EOS 之后补 pad token
 （label 为 `-100`，位置继续累加），因此每篇文档都是所有压缩比的整数倍，尾部余数恒为 0，压缩块不会跨文档。
-对齐由 processor 的 `per_doc_alignment` 驱动：非 CP 时 registry 从 `compress_ratios` 推出 `lcm`（V4 为 `128`）；CP 时该值提升为 `lcm × cp_size`（V4 为 `128 × cp`，由 recipe/example 通过 `DSV4_PER_DOC_ALIGNMENT` 指定），与压缩器、内核看到的块网格同源。布局构建器把这条契约当作前提：`build_v4_metadata` 对非空且按
-`lcm(compress_ratios)` 对齐的流，直接把这一行按 ratio 除出压缩网格（`cmp_k.cu_seqlens`），没有逐文档扫描、
-也没有「尾部不足一块」的分支；破约的流（含空文档或长度不是对齐倍数）在构建处直接报错。压缩器本身同样是扁平的
-`unflatten(1, (-1, ratio))` 折叠，只有在 ratio-4 重叠时才用 `cu_seqlens` 的段起点做掩码。CP 时文档按 `128 × cp` 对齐（每个 entry 再检查 `cp × max(ratio, 1)`）：查询按文档内部分 cp 片，切分后每段仍要是压缩块的整数倍。`doc_chunk_entry` 对未按该值对齐的流直接报错。CP=128 面向长文本（1M 序列），把短文档拼成长文本再切分不是目标场景，填充开销在该场景下可接受。
+对齐由 processor 的 `per_doc_alignment` 驱动。CP 下，每篇文档还要能均分为满足压缩比的查询片段。
+连续切分按 `128 × CP` 对齐，HeadTail 按 `256 × CP` 对齐。详见 [上下文并行](context_parallel.md)。
+`build_v4_metadata` 将符合对齐要求的整行边界折成压缩网格 `cmp_k.cu_seqlens`，
+ratio-4 压缩器使用文档边界阻止重叠窗口读取上一篇文档。
 
 `max_context_length` 和每批 token 数必须是对齐值的倍数，processor 在构建时校验。
 CPT 与 SFT 直接使用上游 `GrainDataLoader`，无需 loader override。
@@ -175,7 +175,7 @@ python -m tests.integration_tests.run_tests /tmp/dsv4-grain-sft-results \
 | --- | --- |
 | `positions` | 必须提供 `[B, S]`，且每条序列从 0 连续递增 |
 | Padding | varlen 流必须覆盖本 rank 的全部 `B * S` 个 token，metadata 不表达 padding token |
-| Context Parallel | 当前 0.4.0 迁移尚未支持，不能通过修改启动参数启用 |
+| Context Parallel | BF16 融合文本训练支持逐文档连续切分和 HeadTail。见 [上下文并行](context_parallel.md) |
 | Tensor Parallel | DSA 路径固定 TP=1（indexer score 对 head 维求和），TP 方案待 CP 之后另行设计 |
 | 空压缩流 | doc-packing 场景要求每条序列至少产生一个完整压缩块；融合路径在 metadata 边界对 `ratio > 1` 且无完整块直接报错（AscendC CSA/HCA 不接受空 `cmp_kv`） |
 | 运行环境 | 需要 `torch_npu`、CANN、HCCL、Ascend NPU，以及匹配的 `cann_ops_transformer` |

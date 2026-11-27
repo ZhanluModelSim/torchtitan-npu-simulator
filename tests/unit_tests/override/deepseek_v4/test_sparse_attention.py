@@ -16,10 +16,9 @@ from torch._subclasses.functional_tensor import dispatch_functionalize
 from torch.utils.checkpoint import CheckpointPolicy
 from torchtitan.config import OverrideConfig, apply_overrides, derive
 from torchtitan.experiments.graph_trainer.make_fx_tracer import minimal_fx_tracer, run_traced
-from torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan.models.deepseek_v4 import attention as reference_attention
 from torchtitan.models.deepseek_v4 import compressor as reference_compressor
-from torchtitan.models.deepseek_v4.compressor import SparseIndexerLoss, compressed_cu_seqlens
+from torchtitan.models.deepseek_v4.compressor import compressed_cu_seqlens
 
 from torchtitan_npu.models.deepseek_v4.attention import Attention
 from torchtitan_npu.models.deepseek_v4.compressor import Indexer, InnerIndexer
@@ -114,24 +113,14 @@ def test_sparse_overrides_keep_outer_attention_indexer_and_state_keys(fused_inde
                 assert type(selected.indexer.inner_indexer) is (AscInnerIndexer if fused_indexer else InnerIndexer)
 
 
-@pytest.mark.parametrize(("axis", "error"), [("tp", "TP=1"), ("cp", "CPInnerAttention")])
-def test_ordinary_fused_attention_rejects_parallel_meshes(axis, error):
+def test_fused_attention_rejects_tp_mesh():
     config = _model_config()
     _select(config)
     inner_attention = config.layers[1].attention.inner_attention.build()
-    mesh = SimpleNamespace(get_optional_mesh={axis: object()}.get)
+    mesh = SimpleNamespace(get_optional_mesh={"tp": object()}.get)
 
-    with pytest.raises(NotImplementedError, match=error):
+    with pytest.raises(NotImplementedError, match="TP=1"):
         inner_attention._parallelize(mesh)
-
-
-def test_explicit_cp_attention_accepts_the_cp_mesh():
-    config = _model_config()
-    _select(config)
-    cp_attention = derive(
-        config.layers[1].attention.inner_attention, ascendc.AscV4ContextParallelSparseAttention.Config
-    )
-    cp_attention.build()._parallelize(SimpleNamespace(get_optional_mesh={"cp": object()}.get))
 
 
 def _dense_kernel_oracle(self, q, swa_k, attn_sink, *, attention_metadata, cmp_k, topk_indices, topk_scores, **_):
@@ -187,7 +176,7 @@ def test_reserved_empty_segments_are_removed_only_from_kernel_frames(monkeypatch
         torch.tensor([-0.3, 0.8]),
     )
 
-    attention = config.layers[1].attention.build()
+    attention = config.layers[1].attention.build().eval()
     indices, scores = attention.indexer.inner_indexer(*arguments[3:6], attention_metadata=metadata)
     actual = attention.inner_attention(
         arguments[0],
@@ -199,7 +188,9 @@ def test_reserved_empty_segments_are_removed_only_from_kernel_frames(monkeypatch
         attention_metadata=metadata,
         aux_loss_denominator=torch.tensor(16),
     )
-    expected = original.build()(*arguments, attention_metadata=reference_metadata, aux_loss_denominator=torch.tensor(16))
+    expected = original.build().eval()(
+        *arguments, attention_metadata=reference_metadata, aux_loss_denominator=torch.tensor(16)
+    )
 
     torch.testing.assert_close(actual, expected, rtol=3e-5, atol=3e-6)
 
@@ -248,22 +239,10 @@ def test_graph_trainer_compressed_offsets_replay_with_a_different_document_count
         torch.testing.assert_close(replay(metadata.documents.cu_seq_q), expected)
 
 
-@pytest.mark.parametrize(
-    ("layer_index", "auxiliary"),
-    [(0, False), (1, False), (2, False), (1, True)],
-    ids=["swa", "csa", "hca", "csa-native-aux"],
-)
-def test_attention_forward_and_gradients_match_upstream_with_dense_kernel(monkeypatch, layer_index, auxiliary):
-    # AuxLoss tracks instance counts globally during construction.
-    monkeypatch.setattr(AuxLoss, "_group_counts", copy.deepcopy(AuxLoss._group_counts))
-    monkeypatch.setattr(AuxLoss, "group_acc", copy.deepcopy(AuxLoss.group_acc))
+@pytest.mark.parametrize("layer_index", [0, 1, 2], ids=["swa", "csa", "hca"])
+def test_attention_forward_and_gradients_match_upstream_with_dense_kernel(monkeypatch, layer_index):
     config = _model_config()
-    if auxiliary:
-        config.layers[1].attention.inner_attention.aux_loss = SparseIndexerLoss.Config(
-            coeff=0.17, softmax_scale=8**-0.5, num_heads=2, mass_weighted=True
-        )
-    else:
-        config.layers[1].attention.inner_attention.aux_loss = None
+    config.layers[1].attention.inner_attention.aux_loss = None
     original = copy.deepcopy(config.layers[layer_index].attention)
     if original.indexer is not None:
         original.indexer = derive(original.indexer, reference_compressor.Indexer.Config)
@@ -315,6 +294,3 @@ def test_attention_forward_and_gradients_match_upstream_with_dense_kernel(monkey
             assert parameter.grad is None, name
         else:
             torch.testing.assert_close(parameter.grad, expected_grad, rtol=2e-4, atol=2e-5, msg=name)
-    if auxiliary:
-        assert selected.indexer.wq_b.weight.grad is not None
-        assert selected.indexer.wq_b.weight.grad.norm() > 0

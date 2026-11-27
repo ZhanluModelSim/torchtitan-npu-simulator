@@ -29,8 +29,7 @@ it -- one group per pair of kernels, one field per direction::
 
 ``AscV4Metadata``
     the model row with this geometry's records and optional compact-selector proof attached.
-    Under context parallelism its ``prepare_cp_metadata`` rebuilds the frames, records and proof
-    for this rank.
+    The CP backend builds its records from rank-local frames.
 
 The compressor has no frames here: the ratio-4 overlap's carry is owned by the
 context-parallel module replacement, not by the eager compressor.  The
@@ -44,8 +43,7 @@ import torch
 from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
 
 from torchtitan_npu.models.common.metadata import KernelFrame
-from torchtitan_npu.models.common.restore import DOC_CHUNK_LAYOUT
-from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata, doc_chunk_entry
+from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata
 from torchtitan_npu.override.a3_workaround import A3KeyWorkaround
 
 __all__ = [
@@ -140,8 +138,8 @@ class AicpuMetadata:
 class AscV4Metadata(DeepSeekV4Metadata):
     """The fused entry: the model row and frames, plus this geometry's AscendC records.
 
-    The row, the frames and the doc-chunk plan are the model's (they describe the tensors, not
-    the kernels); this entry adds what the fused kernels need on top of them:
+    The row and the frames are the model's (they describe the tensors, not the kernels); this
+    entry adds what the fused kernels need on top of them:
 
     - ``aicpu_metadata``: the operator outputs computed for exactly these frames at the eager
       boundary and rebuilt per rank under context parallelism;
@@ -162,45 +160,6 @@ class AscV4Metadata(DeepSeekV4Metadata):
     Built once per microbatch beside the records, so the forward, the backward and the selector read
     one frame and one gather each instead of re-deriving them per layer.
     """
-
-    @staticmethod
-    def prepare_cp_metadata(  # pyrefly: ignore [bad-override]
-        # The seam dispatches on ``type(metadata)``, so this hook's contract is its own class;
-        # widening the parameter would accept a rejecting row and lose this geometry's records.
-        attention_metadata: "AscV4Metadata",
-        *,
-        permutation: torch.Tensor | None,
-    ) -> "AscV4Metadata":
-        """This rank's frames *and* its AscendC records (upstream #4617).
-
-        The rank-local entry comes from the pre-shard row with the static doc-chunk plan
-        (``models/common/restore.chunk_plan``); the records do not carry over, because a record
-        describes the frames it was computed for, so they are rebuilt for the rank-local frames
-        by the same builder that built the global ones.
-        """
-        del permutation
-        # Lazy: the builder imports this module's classes, so the two cannot import each other
-        # eagerly; the hook runs at the eager metadata boundary, never inside a graph.
-        from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import build_aicpu_metadata
-        from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_shard_context
-
-        context = cp_shard_context()
-        if context.cp_mesh is None or context.positions is None:
-            raise ValueError("prepare_cp_metadata needs the CP mesh and the pre-shard positions")
-        if context.load_balancer_type != DOC_CHUNK_LAYOUT:
-            raise ValueError(
-                "the DeepSeek-V4 fused stack's rank-local frames describe the doc-chunk layout, but the "
-                f"context-parallel load balancer is {context.load_balancer_type!r}: run with "
-                f"--parallelism.context-parallel-load-balancer {DOC_CHUNK_LAYOUT}."
-            )
-        row_len = context.positions.shape[-1]
-        local = doc_chunk_entry(
-            attention_metadata,
-            cp_size=context.cp_mesh.size(),
-            cp_rank=context.cp_mesh.get_local_rank(),
-            slab_len=row_len // context.cp_mesh.size(),
-        )
-        return build_aicpu_metadata(local, geometry=attention_metadata.aicpu_metadata.geometry)
 
 
 if AscSparseAttentionMetadata not in SUPPORTED_NODES:

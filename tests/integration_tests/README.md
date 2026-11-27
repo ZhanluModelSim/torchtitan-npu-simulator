@@ -44,6 +44,7 @@ python -m tests.integration_tests.run_tests \
 
 以下为已注册 Suite 的用途，不表示所有用例均已完成 0.4.0 迁移。实际执行还受 runner 的迁移门禁和硬件条件限制：
 * **`models`**：DeepSeek-V4、DeepSeek-V4.1 多卡基础训练冒烟与 Loss 对齐校验；
+* **`deepseek_cp`**：V4 和 V4.1 BF16 双卡逐文档 CP 冒烟，只覆盖连续切分，各跑两步；单独运行；
 * **`deepseek_v4_checkpoint`**：DeepSeek-V4 分布式断点续训两阶段比对；
 * **`deepseek_v4_quantized`**：DeepSeek-V4 Block-FP8 量化（需 Ascend 950 芯片）；
 * **`deepseek_v4_1`**：DeepSeek-V4.1 文本和图像 LoRA 训练与 PEFT 导出；同时纳入默认 `models` suite；

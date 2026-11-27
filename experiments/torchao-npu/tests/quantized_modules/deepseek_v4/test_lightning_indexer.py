@@ -68,13 +68,12 @@ def test_module_swap_routes_teacher_to_indexer_inputs(monkeypatch, batch):
     monkeypatch.setattr(lightning_indexer, "quant_lightning_indexer", quant_li)
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_lightning_indexer_kl_loss_grad", slikg, raising=False)
     selector = torch.nn.Identity()
-    selector.requires_teacher = False
+    original_forward = selector.forward
     config = DeepSeekV4QuantLightningIndexerConfig(input_adapter=input_adapter)
 
     quantize_(selector, config, filter_fn=lambda module, fqn: module is selector)
     indices, scores = selector(query, key, weights, attention_metadata=metadata)
 
-    assert selector.requires_teacher
     assert selector.forward.__func__ is lightning_indexer.quantized_lightning_indexer_forward
     assert indices.shape == (batch * tokens, topk) and indices.dtype == torch.int32
     assert not indices.requires_grad
@@ -115,7 +114,7 @@ def test_module_swap_routes_teacher_to_indexer_inputs(monkeypatch, batch):
     quantize_(
         selector, DeepSeekV4QuantLightningIndexerConfig(step=QATStep.CONVERT), filter_fn=lambda m, fqn: m is selector
     )
-    assert not selector.requires_teacher
+    assert selector.forward == original_forward
 
 
 def test_module_swap_rejects_missing_teacher_gradient(monkeypatch):

@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 from torch.fx.experimental.proxy_tensor import make_fx
 from torchtitan.config import OverrideConfig, apply_overrides
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.models.deepseek_v4.compressor import Compressor
 
 from torchtitan_npu.models.deepseek_v4.compressor import InnerIndexer
@@ -19,6 +20,7 @@ from torchtitan_npu.models.deepseek_v4.flavors import _make_dsv4_config as _make
 from torchtitan_npu.override.common.rms_norm import AscRMSNorm
 from torchtitan_npu.override.common.rope import AscComplexRoPE
 from torchtitan_npu.override.deepseek_v4.compressor import ascendc
+from torchtitan_npu.override.deepseek_v4.context_parallel import CPCompressor, CPIndexer, configure_context_parallel
 
 
 def _model_config():
@@ -55,9 +57,14 @@ def _model_config():
     )
 
 
-def test_native_compressor_override_preserves_state_layout_and_composes_children():
+@pytest.mark.parametrize("cp_degree", [1, 2], ids=["unsharded", "document-cp"])
+def test_native_compressor_override_preserves_state_layout_and_composes_children(cp_degree):
     config = _model_config()
     original = copy.deepcopy(config.layers[0].attention.compressor)
+    parallelism = ParallelismConfig(context_parallel_degree=cp_degree)
+    config = configure_context_parallel(config, parallelism)
+    for _, compressor, _, _ in config.traverse(Compressor.Config):
+        assert isinstance(compressor, CPCompressor.Config) == (cp_degree > 1)
 
     apply_overrides(OverrideConfig(imports=["torchtitan_npu.override.deepseek_v4.compressor.asc"]), config)
 
@@ -70,7 +77,11 @@ def test_native_compressor_override_preserves_state_layout_and_composes_children
         assert node.rope.dim == node.rope_head_dim
         assert getattr(node.rope, "split", 0) == 0
     assert isinstance(config.layers[0].attention.compressor, Compressor.Config)
-    assert type(config.layers[0].attention.indexer.inner_indexer) is InnerIndexer.Config
+    inner_indexer = config.layers[0].attention.indexer.inner_indexer
+    if cp_degree > 1:
+        assert isinstance(inner_indexer, CPIndexer.Config)
+        inner_indexer = inner_indexer.kernel
+    assert type(inner_indexer) is InnerIndexer.Config
     with torch.random.fork_rng(devices=[]):
         reference = original.build()
         module = config.layers[0].attention.compressor.build()

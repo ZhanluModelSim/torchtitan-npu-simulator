@@ -45,7 +45,7 @@ from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.deepseek_v4.compressor import SparseIndexerLoss
 
-from torchtitan_npu.models.deepseek_v4.indexer_loss import scale_fused_teacher
+from torchtitan_npu.models.deepseek_v4.indexer_loss import scale_fused_teacher as scale_fused_teacher
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .compressor import Compressor
@@ -67,8 +67,6 @@ class CompressedSparseInnerAttention2(InnerAttention):
     The reference uses its full-softmax LSE to distill a configured indexer loss.
     Fused ports publish the same teacher from SMLAG on the selector's gradient edge.
     """
-
-    scale_fused_teacher = staticmethod(scale_fused_teacher)
 
     @dataclass(kw_only=True, slots=True)
     class Config(InnerAttention.Config):
@@ -275,19 +273,6 @@ class Attention(BaseAttention):
         self.indexer = cfg.indexer.build()
         self.attention_metadata_key = cfg.inner_attention.attention_metadata_key
         self.inner_attention = cfg.inner_attention.build()
-        requires_teacher = self.indexer.inner_indexer.requires_teacher
-        if hasattr(self.inner_attention, "uses_fused_indexer"):
-            self.inner_attention.uses_fused_indexer = requires_teacher
-        elif requires_teacher and cfg.inner_attention.aux_loss is not None:
-            raise ValueError("Fused indexer training requires a sparse attention backend that emits its teacher.")
-        # The CP mesh this layer restores its key side on, wired by ``parallelize``; ``None`` at
-        # one degree, where the metadata carries no plan and nothing moves.
-        self.cp_group = None
-
-    def _parallelize(self, parallelism_context) -> None:
-        """Take the CP mesh the layer restores its key side on, then recurse."""
-        self.cp_group = parallelism_context.get_optional_mesh("cp")
-        super()._parallelize(parallelism_context)
 
     def forward(
         self,
@@ -316,16 +301,12 @@ class Attention(BaseAttention):
         computed where the layer is a source, otherwise the inputs unchanged.
         """
         num_tokens = x.size(0)
-        # Queries stay on the input's document chunks; key consumers restore their own slab.
         position_k = attention_metadata.position_k
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).view(num_tokens, -1, self.head_dim)
         swa_k = self.kv_norm(self.wkv(x))
 
-        # Every layer compresses and indexes: a source publishes new tensors, a reusing
-        # layer hands back the ones in flight (asserted inside those modules).  A source restores
-        # the stream onto this rank's window inside the compressor, so the layer hands over the
-        # chunks it holds rather than a pre-restored copy.
+        # A source layer publishes new tensors. A reusing layer passes its inputs through.
         cmp_k, latent = self.compressor(x, position_k, cmp_k, attention_metadata=attention_metadata)
         # The indexer is trained by distillation alone, so it reads the trunk as
         # constants.  The shared index keys are the exception: a Reindex Mode layer keeps
@@ -343,11 +324,9 @@ class Attention(BaseAttention):
             candidates=candidates,
         )
 
-        # The rope config carries the un-rotated prefix width, so the module rotates the
         # The query and the per-token key projection rotate at the input's positions.
         q = self.rope(q, positions=positions)
         swa_k = self.rope(swa_k.unsqueeze(1), positions=positions).squeeze(1)
-        swa_k = attention_metadata.key_stream(swa_k, group=self.cp_group)
 
         uses_cmp = self.compress_ratio > 0
         o = self.inner_attention(

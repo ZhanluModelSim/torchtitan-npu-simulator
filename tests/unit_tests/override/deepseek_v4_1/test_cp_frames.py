@@ -3,31 +3,19 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""What the AscendC attention reads off a context-parallel forward's frames.
-
-A sharded forward expresses each rank's per-document reach as the frame's per-sequence length.  The
-**entry** keeps the model's contract: the queries are the rank's chunk grid and both KV frames stay
-the gathered row's, at every degree.  The **kernels** are handed the entry's ``a3`` frames instead,
-because the arch22 kernels right-align their mask at the key frame's end and ignore the reach, so a
-non-final rank gets its reach as that frame -- whose end is then this rank's chunk offset.  At one
-degree the two are the same frame and the options carry the boundary differences, which is what
-makes a ``cp = 1`` versus ``cp > 1`` comparison a comparison of the scheme.
-"""
+"""The local query and key frames passed to the AscendC kernels."""
 
 from itertools import pairwise
 
 import pytest
 import torch
 
-from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
-from torchtitan_npu.override.deepseek_v4_1.lightning_indexer import ascendc as selector_ascendc
 from torchtitan_npu.override import _IS_A5
-from torchtitan_npu.override.deepseek_v4_1.metadata import AicpuGeometry
+from torchtitan_npu.override.deepseek_v4.context_parallel import CPAttention
+from torchtitan_npu.override.deepseek_v4.cp_metadata import DocumentCPLoadBalancer, DocumentCPPlan
+from torchtitan_npu.override.deepseek_v4_1.lightning_indexer import ascendc as selector_ascendc
 from torchtitan_npu.override.deepseek_v4_1.sparse_attn import ascendc as core_ascendc
-from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import (
-    build_fused_metadata,
-    shard_asc_v41_metadata,
-)
+from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import AscV41SparseAttention
 
 # Only the frames are under test, so any window does.
 _WINDOW = 128
@@ -39,38 +27,24 @@ _RATIO = 2
 _GEOMETRY = dict(num_heads=2, head_dim=4, index_topk=8, index_num_heads=4, index_head_dim=4)
 
 
-def _row(positions: torch.Tensor, ratio: int):
-    """The row a fused entry starts from, built by the reference core's own config.
-
-    ``cu_seq_k`` is that config's ratio applied to the row, so the entry's ratio has to be the
-    row's here -- the fused entry never folds a grid its own backend did not produce.
-    """
-    config = CompressedSparseInnerAttention2.Config(window_size=_WINDOW, softmax_scale=0.5, compress_ratio=ratio)
-    return config.build_attention_metadata(positions)
+@pytest.fixture(autouse=True)
+def stub_aicpu_record_generation(monkeypatch):
+    monkeypatch.setattr(core_ascendc, "build_aicpu_metadata", lambda **kwargs: None)
 
 
 def _masks(bounds: list[int], cp_size: int = 1, cp_rank: int = 0, ratio: int = _RATIO):
-    """One geometry's frames, or this rank's after the CP re-cut.
-
-    This is what the AscendC attention's ``AscV41Metadata.prepare_cp_metadata`` runs -- the seam's hook
-    delegates to the same function -- and the frames it returns are the ones the operators grid,
-    so the tests below read them through the same option builder the kernels are called with.
-    """
     positions = torch.cat([torch.arange(end - begin) for begin, end in pairwise(bounds)])
-    entry = build_fused_metadata(
-        _row(positions, ratio),
-        ratio=ratio,
-        geometry=AicpuGeometry(window_size=_WINDOW, **_GEOMETRY),
-    )
+    kernel = AscV41SparseAttention.Config(window_size=_WINDOW, softmax_scale=0.5, compress_ratio=ratio, **_GEOMETRY)
     if cp_size == 1:
-        return entry
-    return shard_asc_v41_metadata(
-        entry,
-        cp_size=cp_size,
-        cp_rank=cp_rank,
-        batch_size=1,
-        slab_len=positions.shape[-1] // cp_size,
+        return kernel.build_attention_metadata(positions)
+
+    packed = CPAttention.Config(kernel=kernel).build_attention_metadata(positions)
+    layout = DocumentCPLoadBalancer.Config().build(
+        seq_len=positions.numel(), attention_metadata=packed, cp_size=cp_size
     )
+    permutation = layout.generate_permutation()
+    plan = DocumentCPPlan.build(permutation, packed.row.q.cu_seqlens, cp_size=cp_size, cp_rank=cp_rank, head_tail=False)
+    return CPAttention.prepare_cp_metadata(packed, permutation=permutation, plan=plan).entries[0]
 
 
 def _core_options(metadata, ratio: int = _RATIO):
@@ -137,14 +111,7 @@ def test_a_ratio_one_frame_keeps_the_targets_residual_spelling(monkeypatch, is_a
 @pytest.mark.parametrize("cp_size, cp_rank", [(2, 1), (4, 3), (8, 7)], ids=["R2r1", "R4r3", "R8r7"])
 @pytest.mark.parametrize("ratio", [1, 2])
 def test_the_anchor_is_this_ranks_chunk_offset(cp_size, cp_rank, ratio):
-    """The entry keeps the whole row; the kernels are handed this rank's reach as the frame's end.
-
-    The row is the degree-independent contract -- ``entry.q`` is the rank's chunk grid and both KV
-    frames are the gathered row's -- while these kernels address a frame and right-align their
-    window and compressed causal limit at its end.  On arch22 the options therefore state the reach
-    itself, which is how that end lands on this rank's chunk; at the final rank the reach is the
-    whole document and the two are one frame, so the same option builder covers both.
-    """
+    """The sliding-window buffer ends at this rank's last query."""
     bounds = [0, 16, 48]
     row = torch.tensor(bounds, dtype=torch.int32)
     chunk = _lengths(bounds) // cp_size
@@ -152,17 +119,16 @@ def test_the_anchor_is_this_ranks_chunk_offset(cp_size, cp_rank, ratio):
     metadata = _masks(bounds, cp_size, cp_rank, ratio=ratio)
     options = _core_options(metadata, ratio)
 
-    # The row's own frames: the queries are this rank's chunk, the keys stay the whole row.
     assert torch.equal(metadata.q.cu_seqlens, (row // cp_size).to(torch.int32))
     assert torch.equal(metadata.q.seqused, chunk)
-    assert torch.equal(metadata.swa_k.cu_seqlens, row)
+    assert torch.equal(metadata.swa_k.cu_seqlens, _prefix(reach))
     assert torch.equal(metadata.swa_k.seqused, reach)
 
     # The kernel's frames: the reach laid out as the frame, so ``seqused`` is its boundary
     # difference and the window is anchored at the chunk's last row.
     assert torch.equal(options["cu_seqlens_q"], (row // cp_size).to(torch.int32))
     assert torch.equal(options["seqused_q"], chunk)
-    assert torch.equal(options["cu_seqlens_ori_kv"], row if _IS_A5 else _prefix(reach))
+    assert torch.equal(options["cu_seqlens_ori_kv"], _prefix(reach))
     assert torch.equal(options["seqused_ori_kv"], reach)
     if not _IS_A5:
         assert torch.equal(options["seqused_ori_kv"], torch.diff(options["cu_seqlens_ori_kv"]))

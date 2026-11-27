@@ -5,7 +5,6 @@
 
 from copy import deepcopy
 from dataclasses import fields, replace
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -106,35 +105,6 @@ def test_pro_refuses_noncompact_or_changed_frames_before_launch():
     options = pypto_pro._pro_options(metadata, metadata.ratio)
     key.seqused.sub_(1)
     with pytest.raises(ValueError, match="changed in place"):
-        _check_compact_guard(options["guard_tensors"], options["guard_versions"])
-
-
-@pytest.mark.parametrize(("a5", "rank"), [(False, 0), (True, 0), (True, 1)])
-def test_cp_rechecks_the_local_operands_only_for_pro(monkeypatch, a5, rank):
-    from torchtitan_npu.override.deepseek_v4.sparse_attn import ascendc
-    from torchtitan_npu.patches.torchtitan.models.common import attention_metadata as native
-
-    monkeypatch.setattr(ascendc, "_IS_A5", a5)
-    mesh = SimpleNamespace(size=lambda: 2, get_local_rank=lambda: rank)
-    monkeypatch.setattr(
-        native,
-        "cp_shard_context",
-        lambda: SimpleNamespace(cp_mesh=mesh, positions=torch.arange(16).repeat(2), load_balancer_type="doc_chunk"),
-    )
-    cut = ascendc.AscV4ContextParallelSparseAttention.prepare_cp_metadata
-    ordinary = cut(_entry(_debug_model(use_pro=False)), permutation=None)
-    assert type(ordinary) is AscV4Metadata
-    torch.testing.assert_close(ordinary.q.seqused, torch.tensor([8, 8], dtype=torch.int32))
-    source = _entry(_debug_model(use_pro=True))
-    if a5 and rank == 0:
-        # A5 leaves a short valid prefix inside each whole-document key frame.
-        with pytest.raises(ValueError, match="compact"):
-            cut(source, permutation=None)
-    else:
-        local = cut(source, permutation=None)
-        options = pypto_pro._pro_options(local, local.ratio)
-        assert options["cu_seqlens_q"] is local.q.cu_seqlens
-        assert options["cu_seqlens_q"] is not source.q.cu_seqlens
         _check_compact_guard(options["guard_tensors"], options["guard_versions"])
 
 

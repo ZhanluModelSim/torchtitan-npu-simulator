@@ -25,22 +25,13 @@ records its kernels launch.  A kernel that cannot read these frames as they are 
 kernels ignore ``seqused`` and anchor their mask at the frame's end -- restates them at its own call
 site (``override/a3_workaround.py``) rather than here: nothing about the row changes.
 
-Under context parallelism the queries are **chunk ``r`` of every document** while the KV side
-stays the **whole row**.  The input layout (``models/common/restore.py``) moves the batch's
-tokens, positions and labels onto the chunk frame once per batch, so ``q.cu_seqlens`` is the
-rank-local chunk grid and the KV frames address the row; a layer that projects keys restores its
-hidden states onto the slab with the entry's :attr:`DeepSeekV4Metadata.cp`, which is what removes
-the per-layer query movement and the output un-permutation.  There are no ``cu_seq_q`` /
-``cu_seq_k`` aliases: read the grid from the frame that addresses it (row grid =
-``swa_k.cu_seqlens``, query grid = ``q.cu_seqlens``, compressed grid = ``cmp_k.cu_seqlens``).
-
 Nothing here describes the compressor's *internal* stream: the ratio-4 carry belongs to the
 context-parallel module replacement, not to the eager compressor.  At one degree a compressor
 stays CP-agnostic: it sees one local stream, one set of positions and, for the overlap, one set
 of ``cu_seqlens``.
 """
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import torch
 from torchtitan.models.common.attention import VarlenAttentionMetadata, create_varlen_metadata_for_document
@@ -48,37 +39,12 @@ from torchtitan.models.common.attention import VarlenAttentionMetadata, create_v
 from torchtitan_npu.models.common.alignment import require_document_alignment
 from torchtitan_npu.models.common.document_intervals import document_intervals
 from torchtitan_npu.models.common.metadata import KernelFrame
-from torchtitan_npu.models.common.restore import (
-    DOC_CHUNK_LAYOUT,
-    RestorePlan,
-    chunk_plan,
-    slab_positions,
-)
 
 __all__ = [
-    "CPDeepSeekMetadata",
     "DeepSeekV4Metadata",
     "KernelFrame",
     "build_v4_metadata",
-    "doc_chunk_entry",
 ]
-
-
-@dataclass(frozen=True, kw_only=True, slots=True)
-class CPDeepSeekMetadata:
-    """One geometry's doc-chunk layout: what the key side restores, and nothing else.
-
-    The plan is a function of the row's boundaries, the degree and the rank -- no operand, no
-    layer -- so it is derived once per microbatch with the entry and read by every layer of the
-    geometry.  At one degree the whole object is ``None``: the slab *is* the frame.
-    """
-
-    restore: RestorePlan
-    """doc-chunk -> slab: the movement the key projections read.
-
-    The positions of the stream it produces are the entry's ``position_k``, so the movement and
-    the geometry stay separate fields even though both are derived from the same boundaries.
-    """
 
 
 @dataclass(kw_only=True, slots=True)
@@ -113,9 +79,7 @@ class DeepSeekV4Metadata:
     """The key stream's own document-relative positions (``[C]``, ``C`` the row under one degree).
 
     They belong to the stream the key projections read, so they are a property of the geometry, not
-    of any module: at one degree they are the input's ``positions``; under context parallelism they
-    are ``slab_positions(...)`` -- the restored window's -- which is why a consumer never derives
-    them and never learns that the stream moved.
+    of any module: they are the input's ``positions``.
     """
 
     documents: VarlenAttentionMetadata | None = None
@@ -124,13 +88,6 @@ class DeepSeekV4Metadata:
     @property
     def cu_seq_q(self) -> torch.Tensor:
         return self.q.cu_seqlens if self.documents is None else self.documents.cu_seq_q
-
-    cp_layout = DOC_CHUNK_LAYOUT
-    """The layout these frames describe (``--parallelism.context-parallel-load-balancer``).
-
-    A rank-local entry of this stack exists for the doc-chunk arrangement only, so the CP seam can
-    resolve an unnamed layout to it instead of guessing.
-    """
 
     batch_size: int = 1
     """The query container's leading dimension.
@@ -148,46 +105,6 @@ class DeepSeekV4Metadata:
     (``[1, seq_len, n_cmp]``, document-local numbering with ``-1`` for an unreachable slot), so
     the reference forward reads it instead of deriving it per layer.  A ratio-4 geometry's
     selection is the selector's, and a fused entry never reads this field."""
-
-    cp: CPDeepSeekMetadata | None = None
-    """The doc-chunk layout under context parallelism, ``None`` at one degree.
-
-    It carries the movement, not the frames and not the positions: those are the same fields at
-    every degree (``position_k`` already describes the stream this rank's keys read), and the
-    entry's grids already describe the degree it was built for."""
-
-    def key_stream(self, x: torch.Tensor, *, group) -> torch.Tensor:
-        """The stream this entry's key projections read: the input's, or this rank's window.
-
-        At one degree the layout left the row in place, so the input *is* the stream; under
-        context parallelism it is the window this rank's chunks are restored onto.  A consumer
-        hands over the stream as the layout produced it and never branches on the degree.
-        """
-        if self.cp is None:
-            return x
-        return self.cp.restore.apply(x.unsqueeze(0), group=group).squeeze(0)
-
-    @staticmethod
-    def prepare_cp_metadata(
-        attention_metadata: "DeepSeekV4Metadata",
-        *,
-        permutation: torch.Tensor | None,
-    ) -> "DeepSeekV4Metadata":
-        """Refuse context parallel: only the fused stack has a rank-local form.
-
-        The row is the whole packed sequence and this entry hands one grid to both sides of the
-        attention, so a rank that holds a chunk has no metadata a reference consumer could read.
-        A CP run therefore stops here, before any layer runs, and the fused entry
-        (``AscV4Metadata``) overrides this with the frames and records rebuilt from the rank's own
-        chunks.
-        """
-        del attention_metadata, permutation
-        raise ValueError(
-            "the DeepSeek-V4 reference stack does not support context parallel: its metadata "
-            "describes one contiguous document stream, so it cannot describe a rank-local row. "
-            "The current eager V4 upgrade requires CP=1. Legacy geometry backends "
-            "require explicit configuration and separate validation."
-        )
 
 
 def _hca_slots(cu_seq_q: torch.Tensor, cu_seq_k: torch.Tensor, ratio: int) -> torch.Tensor:
@@ -225,35 +142,6 @@ def _frames_from_row(
             cu_seqlens=cu_seq_k.to(torch.int32),
             seqused=torch.diff(cu_seq_k).to(torch.int32),
             residual=(lengths % ratio).to(torch.int32),
-        )
-    return q, swa_k, cmp_k
-
-
-def _frames_from_chunks(
-    cu_seq_q: torch.Tensor,
-    ratio: int,
-    *,
-    cp_size: int,
-    cp_rank: int,
-) -> tuple[KernelFrame, KernelFrame, KernelFrame | None]:
-    """The frames of a rank's doc-chunk query frame over the whole-row KV frame.
-
-    The queries are chunk ``cp_rank`` of every document, so their grid is the row's folded at the
-    degree and their ``seqused`` is one chunk.  The keys stay the row, and their ``seqused`` is
-    how far these queries reach into each document -- ``(cp_rank + 1)`` chunks -- which is what
-    keeps the kernels' end-aligned window and causal limit anchored at this rank's chunk.
-    """
-    lengths = torch.diff(cu_seq_q).to(torch.int32)
-    chunk = (lengths // cp_size).to(torch.int32)
-    reach = ((cp_rank + 1) * chunk).to(torch.int32)
-    q = KernelFrame(cu_seqlens=(cu_seq_q // cp_size).to(torch.int32), seqused=chunk)
-    swa_k = KernelFrame(cu_seqlens=cu_seq_q.to(torch.int32), seqused=reach)
-    cmp_k = None
-    if ratio > 1:
-        cmp_k = KernelFrame(
-            cu_seqlens=(cu_seq_q // ratio).to(torch.int32),
-            seqused=(reach // ratio).to(torch.int32),
-            residual=(reach % ratio).to(torch.int32),
         )
     return q, swa_k, cmp_k
 
@@ -313,35 +201,4 @@ def build_v4_metadata(
         position_k=positions,
         batch_size=1,
         slots=slots,
-    )
-
-
-def doc_chunk_entry(
-    attention_metadata: DeepSeekV4Metadata,
-    *,
-    cp_size: int,
-    cp_rank: int,
-    slab_len: int,
-) -> DeepSeekV4Metadata:
-    """This rank's entry: the doc-chunk query frame, the row's KV frames and the restore.
-
-    ``attention_metadata`` is the row's entry (built from the pre-shard positions); ``slab_len`` is
-    the **slab** width -- the shape of the rows this rank holds, not of the row.  The frames and
-    the plan are derived from the row's boundaries alone, so the entry crosses no collective.
-    """
-    row = attention_metadata.swa_k.cu_seqlens
-    ratio = attention_metadata.ratio
-    require_document_alignment(row, cp_size=cp_size, ratio=ratio)
-    q, swa_k, cmp_k = _frames_from_chunks(row, ratio, cp_size=cp_size, cp_rank=cp_rank)
-    restore = RestorePlan(exchange=chunk_plan(row, cp_size, cp_rank, slab_len))
-    # ``slots`` is the reference selection the fused stack never reads; a rank's entry has no
-    # row-wide selection to carry, so it is dropped rather than left describing the row.
-    return replace(
-        attention_metadata,
-        q=q,
-        swa_k=swa_k,
-        cmp_k=cmp_k,
-        position_k=slab_positions(row, cp_size, cp_rank, slab_len).squeeze(0),
-        slots=None,
-        cp=CPDeepSeekMetadata(restore=restore),
     )

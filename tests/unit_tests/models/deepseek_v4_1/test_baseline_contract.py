@@ -115,7 +115,7 @@ def test_v41_moe_rides_the_common_stack_with_an_opt_in_vision_bias():
 def test_baseline_rejects_tensor_parallel():
     config = deepseek_v4_1_debugmodel_multimodal()
     config.parallelism.tensor_parallel_degree = 2
-    with pytest.raises(NotImplementedError, match="TP=CP=PP=1"):
+    with pytest.raises(NotImplementedError, match="TP=PP=1"):
         with torch.device("meta"):
             model = config.model.build()
         model.parallelize(parallelism=config.parallelism)

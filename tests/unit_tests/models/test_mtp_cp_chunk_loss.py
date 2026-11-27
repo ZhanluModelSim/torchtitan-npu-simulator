@@ -8,8 +8,9 @@ import copy
 import dataclasses
 from importlib import import_module
 
-import pytest
 import torch
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.models.common.attention.cp_attention import CPInnerAttention
 
 from torchtitan_npu.models.deepseek_v4.mtp import (
     MTPChunkedLossWrapper,
@@ -20,13 +21,12 @@ _community_loss = import_module("torchtitan.components.loss")
 _community_mtp = import_module("torchtitan.models.deepseek_v3.mtp")
 
 
-def test_dsv4_mtp_rejects_cp_configuration():
-    config = deepseek_v4_debugmodel(num_mtp_layers=1)
-    with torch.device("meta"):
-        model = config.model.build()
-    parallelism = dataclasses.replace(config.parallelism, context_parallel_degree=2)
-    with pytest.raises(NotImplementedError, match="TP=CP=PP=1"):
-        model.parallelize(parallelism=parallelism)
+def test_dsv4_mtp_uses_cp_attention_for_all_depths():
+    parallelism = ParallelismConfig(context_parallel_degree=2)
+    config = deepseek_v4_debugmodel(num_mtp_layers=1, parallelism=parallelism)
+    assert config.model.mtp_layers
+    for layer in config.model.mtp_layers:
+        assert isinstance(layer.attention.inner_attention, CPInnerAttention.Config)
 
 
 @dataclasses.dataclass(frozen=True)

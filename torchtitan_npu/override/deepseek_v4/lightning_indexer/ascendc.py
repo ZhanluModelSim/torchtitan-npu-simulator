@@ -91,8 +91,6 @@ class AscIndexerMixin:
 class AscInnerIndexer(AscIndexerMixin, InnerIndexer):
     """BF16 selection for V4 compressed sparse attention."""
 
-    requires_teacher = True
-
     @dataclass(kw_only=True, slots=True)
     class Config(InnerIndexer.Config):
         pass

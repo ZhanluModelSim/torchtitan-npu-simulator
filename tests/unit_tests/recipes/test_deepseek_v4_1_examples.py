@@ -37,7 +37,6 @@ def example_environment(monkeypatch):
         "DATA_FILES",
         "DATASET_PATH",
         "HF_ASSETS_PATH",
-        "DSV41_PER_DOC_ALIGNMENT",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("HF_ASSETS_PATH", str(Path(__file__).resolve().parents[3] / "tests/assets/deepseek_v3"))
@@ -95,14 +94,16 @@ def test_a5_eight_rank_multimodal_qat_recipe(example_environment):
 
 
 @pytest.mark.cpu
-def test_long_context_recipe_rejects_cp_until_its_lifecycle_is_migrated():
-    from torchtitan_npu.models.deepseek_v4_1.parallelize import validate_deepseek_v4_1_parallelism
+def test_long_context_recipe_uses_document_cp_and_full_recomputation():
+    from torchtitan.distributed.activation_remat import FullActivationRematConfig
+    from torchtitan.models.common.attention.cp_attention import CPInnerAttention
 
     config = ConfigLoader().load(["--module", _MODULE, "--config", "deepseek_v4_1_flash_cpt_1m_a5"])
     assert config.parallelism.context_parallel_degree == 128
+    assert config.dataloader.dataset.dataset.processor.per_doc_alignment == 256
+    assert isinstance(config.model.layers[0].attention.inner_attention, CPInnerAttention.Config)
+    assert isinstance(config.activation_remat, FullActivationRematConfig)
     assert not config.engram_enabled
-    with pytest.raises(NotImplementedError, match=r"TP=CP=PP=1"):
-        validate_deepseek_v4_1_parallelism(config.model, training=config.training, parallelism=config.parallelism)
 
 
 @pytest.mark.cpu

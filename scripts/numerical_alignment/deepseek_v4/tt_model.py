@@ -16,7 +16,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from torchtitan_npu.models.common.restore import DOC_CHUNK_LAYOUT
+# Activate the NPU integration before loading TorchTitan model configs.
+import torchtitan_npu  # noqa: F401
 
 from ..utils import checkpoint as checkpoint_utils
 from . import config as dsv4_config
@@ -112,23 +113,18 @@ def forward_logits(
 ) -> torch.Tensor:
     """Run the DSV4 TorchTitan forward protocol and return logits."""
 
+    from torchtitan.config.parallelism import ParallelismConfig
+
     positions = torch.arange(tokens.shape[1], dtype=torch.int64, device=tokens.device).repeat(tokens.shape[0])
-    # The model owns the metadata seam (upstream #4897/#4116): it builds one entry per
-    # attention geometry and hands the map to the forward, so an offline forward owes it the
-    # same preprocessing the trainer does.
-    parallel_dims = SimpleNamespace(cp_enabled=False, get_mesh=lambda name: None)
-    parallelism = SimpleNamespace(
-        spmd_backend=None,
-        context_parallel_load_balancer=DOC_CHUNK_LAYOUT,
-        context_parallel_ptrr_mask_key=None,
-    )
+    # This comparison runs on one device outside a distributed process group.
+    parallelism_context = SimpleNamespace(cp_enabled=False, spmd_dense_mesh=lambda: None)
     flat_tokens = tokens.flatten()
-    inputs, _, extra_kwargs = model.preprocess_inputs(
+    inputs, _, model_kwargs, _ = model.preprocess_inputs(
         {"input": flat_tokens, "labels": flat_tokens, "positions": positions},
-        parallel_dims=parallel_dims,
-        parallelism=parallelism,
+        parallelism_context=parallelism_context,
+        parallelism=ParallelismConfig(data_parallel_shard_degree=1),
         max_num_documents=tokens.shape[0],
         max_context_length=tokens.shape[1],
     )
-    logits = model(inputs, **extra_kwargs).reshape(*tokens.shape, -1)
+    logits = model(inputs, **model_kwargs).reshape(*tokens.shape, -1)
     return logits[:, -1, :] if last_token_only else logits

@@ -167,8 +167,6 @@ class InnerIndexer(Module):
     whole indexer -- the indexer's projections, norms and rope stay where they are.
     """
 
-    requires_teacher = False
-
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         mode: IndexerMode

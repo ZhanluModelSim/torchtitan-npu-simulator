@@ -24,6 +24,9 @@ from torchtitan_npu.models.deepseek_v4_1.attention import (
 from torchtitan_npu.models.deepseek_v4_1.attention import (
     DeepSeekV41Metadata as _DeepSeekV41Metadata,
 )
+from torchtitan_npu.models.deepseek_v4_1.attention import (
+    scale_fused_teacher,
+)
 
 from ..configs import ModelType
 from ..configs.deepseek_v4_1 import V41FilterKeys
@@ -164,19 +167,6 @@ class _V41QuantAttentionMetadata(_DeepSeekV41Metadata):
 
     aicpu_metadata: Any
 
-    @staticmethod
-    def prepare_cp_metadata(  # pyrefly: ignore [bad-override]
-        attention_metadata: _V41QuantAttentionMetadata,
-        *,
-        permutation,
-    ):
-        """The quantized stack does not rebuild its metadata per rank yet (context parallelism)."""
-        del attention_metadata, permutation
-        raise ValueError(
-            "the quantized sparse attention does not rebuild its metadata per rank yet: run it "
-            "with --parallelism.context-parallel-degree 1."
-        )
-
 
 class QuantV41SparseAttention(DeepSeekV41CompressedSparseInnerAttention2):
     """The quantized sparse attention: the reference attention's node, its forward swapped.
@@ -186,7 +176,7 @@ class QuantV41SparseAttention(DeepSeekV41CompressedSparseInnerAttention2):
     class the same name and is swapped in by ``quantize_`` below.
     """
 
-    uses_fused_indexer = False
+    scale_fused_teacher = staticmethod(scale_fused_teacher)
 
     @dataclass(kw_only=True, slots=True)
     class Config(DeepSeekV41CompressedSparseInnerAttention2.Config):
@@ -228,7 +218,6 @@ class QuantV41SparseAttention(DeepSeekV41CompressedSparseInnerAttention2):
                 cu_seq_q=row.cu_seq_q,
                 cu_seq_k=row.cu_seq_k,
                 position_k=row.position_k,
-                restore=row.restore,
                 ratio=self.compress_ratio,
                 q=q,
                 swa_k=swa_k,

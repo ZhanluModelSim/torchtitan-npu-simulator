@@ -15,7 +15,6 @@ import torch
 import torch.nn.functional as F
 from torchtitan.components.optim import AdamW, DistMuon
 
-from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import cp_parallel_dims, tiny_v41_model
 from torchtitan_npu.config import OptimizerConfig
 from torchtitan_npu.models.deepseek_v4_1 import (
     EngramArgs,
@@ -186,14 +185,16 @@ def test_per_row_history_and_one_window_state_the_same_rows():
     torch.testing.assert_close(window, other_tail, rtol=0, atol=0)
 
 
-def test_doc_chunk_engram_history_matches_full_document_hashes(monkeypatch):
-    model, _ = tiny_v41_model(monkeypatch)
-    model.engram_history_size = 2
+@pytest.mark.parametrize(
+    "local_rows",
+    [[4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23], [0, 1, 8, 9, 10, 11, 6, 7, 20, 21, 22, 23]],
+)
+def test_document_cp_engram_history_matches_full_document_hashes(local_rows):
+    from torchtitan_npu.override.deepseek_v4.context_parallel import engram_history
+
     tokens = torch.arange(24)
     positions = torch.cat((torch.arange(8), torch.arange(16)))
-    local_rows = torch.tensor([4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23])
-
-    history = model._engram_row_history(tokens, positions, cp_parallel_dims(2, 1))
+    history = engram_history(tokens, 2)[local_rows]
     table = _build_engram().table
     expected = table.hash(tokens, positions)[local_rows]
     actual = table.hash(tokens[local_rows], positions[local_rows], token_history=history)

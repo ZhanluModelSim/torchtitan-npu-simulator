@@ -58,9 +58,6 @@ class Compressor(Module):
         super().__init__()
         self.compress_ratio = config.compress_ratio
         self.is_source = config.is_source
-        # The CP mesh: wired by the framework's ``Module._parallelize`` recursion, ``None`` at one
-        # degree.  A reusing layer never restores anything, so this is set before the early return.
-        self.group = None
         if not self.is_source:
             return
         if config.rope is None or config.wkv is None or config.norm is None:
@@ -73,11 +70,6 @@ class Compressor(Module):
             self.wgate = config.wgate.build()
         self.norm = config.norm.build()
         self.rope = config.rope.build()
-
-    def _parallelize(self, parallelism_context) -> None:
-        """Take the CP mesh the framework hands down to every module."""
-        self.group = parallelism_context.get_optional_mesh("cp")
-        super()._parallelize(parallelism_context)
 
     def forward(
         self,
@@ -109,11 +101,6 @@ class Compressor(Module):
             )
         if not self.is_source:
             return cmp_k, None
-
-        if attention_metadata is not None:
-            # The pooling is the row's, so a source layer restores the stream onto this rank's
-            # window first (the identity at one degree); the caller hands over the chunks it holds.
-            x_TD = attention_metadata.key_stream(x_TD, group=self.group)
 
         ratio = self.compress_ratio
         num_tokens = x_TD.size(0)

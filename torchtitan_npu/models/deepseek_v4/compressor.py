@@ -10,14 +10,32 @@ from dataclasses import dataclass
 
 import spmd_types as spmd
 import torch
+import torch_remat as remat
 from attn_gym.sparse import lightning_indexer
 from torchtitan.models.base.module import Module
 from torchtitan.models.deepseek_v4 import compressor as v4_compressor
+from torchtitan.models.deepseek_v4.attention import _packed_cu_seqlens
 from torchtitan.models.deepseek_v4.compressor import (
     _hadamard,  # noqa: F401 -- preserve the existing helper import path
 )
 
 from torchtitan_npu.models.common.document_intervals import document_intervals
+
+
+class Compressor(v4_compressor.Compressor):
+    """Accept the same packed-document metadata as the other attention components."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(v4_compressor.Compressor.Config):
+        pass
+
+    def forward(self, x, positions, cu_seqlens=None, *, attention_metadata=None):
+        if cu_seqlens is None:
+            cu_seqlens = _packed_cu_seqlens(attention_metadata)
+        return self._compress(x, positions, cu_seqlens)
+
+    def _compress(self, x, positions, cu_seqlens):
+        return super().forward(x, positions, cu_seqlens)
 
 
 class Indexer(v4_compressor.Indexer):
@@ -32,7 +50,16 @@ class Indexer(v4_compressor.Indexer):
         self.inner_indexer = config.inner_indexer.build()
 
     def forward(self, x, qr, *, positions, cu_seqlens=None, attention_metadata=None):
-        idx_q, idx_k, idx_w = super().forward(x, qr, positions=positions, cu_seqlens=cu_seqlens)
+        q = self.wq_b(qr).view(x.size(0), self.num_index_heads, self.head_dim)
+        q_nope, q_rope = q.split([self.head_dim - self.rope_head_dim, self.rope_head_dim], dim=-1)
+        remat.recompute_needs_tensor(q_nope, q_rope)
+        idx_q = self._rotate_activation(torch.cat((q_nope, self.rope(q_rope, positions=positions)), dim=-1))
+        idx_k = self._rotate_activation(
+            self.compressor(x, positions=positions, cu_seqlens=cu_seqlens, attention_metadata=attention_metadata)
+        )
+        weights = self.weights_proj(x)
+        remat.recompute_needs_tensor(weights)
+        idx_w = weights * (self.softmax_scale * self.num_index_heads**-0.5)
         return self.inner_indexer(idx_q, idx_k, idx_w, attention_metadata=attention_metadata)
 
 
@@ -100,8 +127,6 @@ def student_logits_at_picks(
 
 
 class InnerIndexer(Module):
-    requires_teacher = False
-
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         index_topk: int
