@@ -80,6 +80,16 @@ class RuntimeSession:
             self.capabilities["multi_head_moe_sla2_virtual_fusions"] = (
                 "dispatcher Meta/autograd; opt-in sparse and linear SLA2 branch fusion boundaries"
             )
+        if prepared.trainer.model_spec.name == "sys2mot":
+            from torchtitan_simulator.compat.sys2mot import install_sys2mot_meta_support
+
+            bridges = install_sys2mot_meta_support(self.patches)
+            self.capabilities["sys2mot_flash_attention_meta_bridge"] = (
+                "dispatcher Meta/autograd; NPU FlashAttention fusion boundary for the ViT SDPA"
+            )
+            self.capabilities["sys2mot_norm_rotary_capture_boundaries"] = (
+                f"vendor fused npu.npu_rms_norm / npu.npu_rotary_mul[half] with Meta autograd bridges ({bridges})"
+            )
         if prepared.trainer.model_spec.name == "deepseek_v4_1":
             from torchtitan_simulator.compat.deepseek_v4_1 import (
                 install_deepseek_v4_1_input_adapter,

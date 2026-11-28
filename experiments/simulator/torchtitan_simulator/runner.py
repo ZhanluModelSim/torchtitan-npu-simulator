@@ -8,6 +8,7 @@
 import json
 import logging
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import Literal
 
 import torch
@@ -190,6 +191,48 @@ def _simulate(simulation, timings: HostTimings):
             original_shapes = {name: tuple(parameter.shape) for name, parameter in logical_named_parameters(model)}
             from torchtitan_simulator.compat.meta_initialization import meta_initialization
 
+            teacher = None
+            teacher_shapes = {}
+            if getattr(config.loss, "distill", False):
+                # The reference distillation runs a frozen teacher VLA per step
+                # (backbone forward only: embed_prefix + layers + finish with
+                # logits) and distills logits KL + hidden MSE. The teacher is
+                # a meta model of the same capture config (widths equal, so the
+                # Distiller projection is Identity; the reference loads the
+                # real teacher size from a checkpoint the file does not carry).
+                # Production distillation shards the teacher in-loop with the
+                # same FSDP2+EP recipe as the student: the teacher is a second
+                # independent FSDP tree (same one-process two-tree shape as
+                # qwen3_vl's vision tower + decoder), so its forward all-
+                # gathers and EP all-to-alls are captured natively. Frozen +
+                # no_grad keeps it out of backward and the optimizer.
+                with timings.measure("teacher_build"):
+                    teacher = build_meta_model(prepared)
+                    teacher.eval()
+                    teacher.requires_grad_(False)
+                    teacher_shapes = {
+                        name: tuple(parameter.shape) for name, parameter in logical_named_parameters(teacher)
+                    }
+                with timings.measure("teacher_parallelize"), meta_initialization():
+                    # No AC and no compile on the frozen tree; the dense FSDP2
+                    # and EP wiring match the student exactly.
+                    teacher = config.model_spec.parallelize_fn(
+                        teacher,
+                        parallel_dims=dims,
+                        training=config.training,
+                        parallelism=config.parallelism,
+                        compile_config=replace(config.compile, enable=False),
+                        ac_config=None,
+                        dump_folder=config.dump_folder,
+                    )
+                # FSDP2 unshard rides the ROOT module's __call__ pre-hook; the
+                # root unit owns the vision stem, so the teacher entry must be
+                # a module call. Bind the instance forward to the backbone
+                # path (the loss-side contract) instead of bypassing __call__
+                # via backbone_forward, which would leave the root-sharded
+                # vision conv weight a DTensor inside aten.convolution.
+                teacher.forward = teacher.backbone_forward
+
             with timings.measure("parallelize"), meta_initialization():
                 model = config.model_spec.parallelize_fn(
                     model,
@@ -227,6 +270,9 @@ def _simulate(simulation, timings: HostTimings):
             loss_fn = config.loss.build(compile_config=config.compile)
             loss_fn.set_lm_head(model.lm_head)
             model._skip_lm_head = True
+            if teacher is not None:
+                loss_fn.set_teacher(teacher)
+                model._distill_capture = True
             from torchtitan_npu.extensions.torchtitan.distributed.flex_shard.planning import collect_planning_timings
 
             with collect_planning_timings() as planning_timings:
@@ -278,6 +324,22 @@ def _simulate(simulation, timings: HostTimings):
             )
             inputs = {"tokens": tokens.to("meta"), **to_meta_metadata(kwargs, host_splits=host_splits)}
             labels = labels.to("meta")
+            # Offline distillation consumes the teacher's precomputed outputs as
+            # explicit loss inputs. The runner supplies deterministic stand-ins
+            # shaped to the student side; building them HERE keeps the
+            # synthesis outside the captured graph, so the step matches a real
+            # offline training step (KD/hidden math on loaded tensors only).
+            # Full contiguous Meta storages -- NOT stride-0 expand views: the
+            # step registers these as initial-memory inputs, and a stride-0
+            # view's underlying storage would misreport the loaded input bytes.
+            teacher_loss_inputs: dict[str, torch.Tensor] = {}
+            if getattr(config.loss, "distill_offline", False):
+                teacher_loss_inputs["teacher_logits"] = torch.zeros(
+                    (batch_size, seq_len, config.model_spec.model.vocab_size), dtype=torch.float32, device="meta"
+                )
+                teacher_loss_inputs["teacher_hidden"] = torch.zeros(
+                    (batch_size, seq_len, config.model_spec.model.dim), dtype=torch.float32, device="meta"
+                )
             gradient_manifest = {}
             dense_gradient_exemptions = set()
             from torchtitan.distributed.utils import clip_grad_norm_, get_spmd_context
@@ -290,7 +352,13 @@ def _simulate(simulation, timings: HostTimings):
                 with train_context():
                     with timings.measure(f"{execution}.forward"), compute_block("F"):
                         predictions = model(**input_dict)
-                        loss, _ = loss_fn(predictions, labels, global_valid_tokens, positions=input_dict["positions"])
+                        loss, _ = loss_fn(
+                            predictions,
+                            labels,
+                            global_valid_tokens,
+                            positions=input_dict["positions"],
+                            **teacher_loss_inputs,
+                        )
                     with timings.measure(f"{execution}.backward"), compute_block("B"):
                         loss.backward()
                 manifest, exemptions = _gradient_manifest(model)
@@ -339,6 +407,26 @@ def _simulate(simulation, timings: HostTimings):
                     zero_grad=optimizers.zero_grad,
                 )
             gradient_manifest.clear()
+            if teacher is not None:
+                # The frozen teacher tree carries its own sharded parameters
+                # (persistent storage, no optimizer states). Collect them
+                # AFTER warmup so the recorded sizes match the steady state
+                # the memory estimator snapshots: FSDP2 never runs a backward
+                # for the teacher, so the root and the never-resharded
+                # [norm, lm_head] unit stay unsharded on device across steps
+                # while the remaining units reshard after every forward.
+                for name, parameter in logical_named_parameters(teacher):
+                    local = getattr(parameter, "_local_tensor", parameter)
+                    mesh = getattr(parameter, "device_mesh", None)
+                    parameter_layouts[f"teacher.{name}"] = {
+                        "original_shape": teacher_shapes[name],
+                        "local_shape": tuple(local.shape),
+                        "dtype": str(parameter.dtype),
+                        "storage_bytes": local.numel() * local.element_size(),
+                        "mesh_dim_names": tuple(mesh.mesh_dim_names) if mesh is not None else (),
+                        "mesh_shape": tuple(mesh.shape) if mesh is not None else (),
+                        "placements": str(getattr(parameter, "placements", ())),
+                    }
             # Install observers only after native lazy state has been initialized.
             # torch_npu may install its final FSDP layer on first fully_shard.
             install_fsdp_residency_hooks(runtime.patches)
@@ -346,11 +434,12 @@ def _simulate(simulation, timings: HostTimings):
             execution = "capture"
             with timings.measure("capture_step"):
                 workload = run_simulation_step(
-                    model_parts=[model],
+                    model_parts=[model, teacher] if teacher is not None else [model],
                     parallel_dims=dims,
                     forward_backward_step=forward_backward,
                     input_dict=inputs,
                     labels=labels,
+                    extra_loss_inputs=teacher_loss_inputs or None,
                     optimizer_step=optimizers.step,
                     optimizer_zero_grad=optimizers.zero_grad,
                     lr_scheduler_step=scheduler.step,
