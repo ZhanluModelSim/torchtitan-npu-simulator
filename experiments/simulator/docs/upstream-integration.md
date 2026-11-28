@@ -107,3 +107,21 @@ F 内可能交错 lm_head/loss backward，不能只按 `phase` 切 F/B。原始 
 每个模型条目的 `identity` 只包含 `config`；`assignments` 另设置默认 MTP 数量。选择模型时只重置 `config`、`model_overrides` 和结构字段 `num_mtp_modules`，保留精度、并行、输入、优化器和卸载配置。缺失字段继承原生默认，提示值不要求写入任务。DeepSeek-V4 的几何提示复用 override 的同一读取逻辑；Qwen3 和 Kimi K3 保留现有不支持 flat `model_overrides` 的限制。
 
 目录生成会导入框架配置，但不创建模型、不执行 override、不抓图，不加载任意用户 `module.factory`。普通 `torchtitan_simulator` 导入仍不加载 Torch。目录不是运行时预检或捕获成功证明。
+
+### 按草稿查询一个字段
+
+`describe_configuration_field(simulation, path, candidates=...)` 面向已登记的 preset，路径相对训练配置。它保留草稿其他字段，用 `prepare_capture_config` 分别预检当前组合与每个候选。闭合枚举默认列出声明的值；DP 和 batch 等整数范围可通过 `candidates` 指定要比较的点。候选的 `available` 和 `reason` 描述这次配置预检，模型构建、图形状和算子执行仍要现场验证。查询可加载内置 recipe 及其原生 override，禁止通过草稿导入自定义 factory 和非空的显式 override 模块列表。
+
+有效草稿和可用候选的 `reason`、`failed_check`、`failed_path` 均为 `null`。被拒绝的草稿和候选均保留原生错误详情 `reason`，并通过 `failed_check` 标识失败检查。能定位到单个字段时，`failed_path` 给出相对训练配置的路径段。例如在 DeepSeek V4 的 BF16 基础参数草稿上查询 TP，候选会报告 `capture_dtype` 和 `["training_dtype"]`。GBS、微批与 DP 共同造成整除冲突时，检查为 `batch_divisibility`，路径为 `null`。无结构化来源的原生错误返回 `native_configuration` 和 `null`。
+
+```python
+from torchtitan_simulator.config import SimulationConfig
+from torchtitan_simulator.configuration_metadata import describe_configuration_field
+
+draft = SimulationConfig(world_size=4, local_batch_size=1, global_batch_size=2)
+result = describe_configuration_field(draft, ["tensor_parallel_degree"], candidates=[1, 2])
+assert not result["validation"]["valid"]
+assert [choice["available"] for choice in result["field"]["choices"]] == [False, True]
+```
+
+在上例中，TP=1 时自动分片得到 DP=4，每个微步需要 4 个样本，与 GBS=2 冲突。TP=2 时 DP=2、GA=1。合法草稿的 `batch_configuration` 返回本地微批、有效 GBS、DP 复制与分片度、总 DP 度和 GA。GBS 继承原生 recipe 的负数哨兵时，按一个微步取值；显式 GBS 必须是「本地微批 × DP 度」的正整数倍。现场执行使用同一份已准备的 batch 配置。仅需原生模型配置时仍可使用 `prepare_config`，捕获预检还检查模型族已知的参数 dtype 限制。

@@ -49,3 +49,107 @@ from torchtitan_simulator.runner import simulate
 assert callable(simulate) and callable(iter_metadata_tensors) and callable(to_meta_metadata)
 """
     subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, text=True)
+
+
+def test_draft_rejects_changed_dp_and_probes_repair_without_mutating_request():
+    from torchtitan_simulator.config import SimulationConfig
+    from torchtitan_simulator.configuration_metadata import describe_configuration_field
+
+    draft = SimulationConfig(world_size=4, local_batch_size=1, global_batch_size=2)
+    query = describe_configuration_field(draft, ["tensor_parallel_degree"], candidates=[1, 2, True])
+    assert query["batch_configuration"] is None
+    assert not query["validation"]["valid"]
+    assert "global_batch_size=2" in query["validation"]["reason"]
+    current, repaired, wrong_type = query["field"]["choices"]
+    assert not current["available"] and current["reason"] == query["validation"]["reason"]
+    assert current["failed_check"] == "batch_divisibility" and current["failed_path"] is None
+    assert repaired["available"] and repaired["reason"] is None
+    assert not wrong_type["available"] and "integer" in wrong_type["reason"]
+    assert wrong_type["failed_check"] == "candidate_type" and wrong_type["failed_path"] == ["tensor_parallel_degree"]
+    assert draft.tensor_parallel_degree == 1
+
+
+def test_draft_closed_fields_and_nested_geometry_probe_native_combinations():
+    from torchtitan_simulator.config import SimulationConfig
+    from torchtitan_simulator.configuration_metadata import describe_configuration_field
+
+    config = SimulationConfig(selective_ac_save_ops=["comm"], activation_checkpoint_mode="selective")
+    result = describe_configuration_field(config, ["activation_checkpoint_mode"])
+    modes = {item["value"]: item for item in result["field"]["choices"]}
+    assert set(modes) == {"none", "full", "selective"}
+    assert result["validation"] == {"valid": True, "reason": None, "failed_check": None, "failed_path": None}
+    assert modes["selective"]["available"]
+    assert modes["selective"]["failed_check"] is None and modes["selective"]["failed_path"] is None
+    assert not modes["full"]["available"] and "selective" in modes["full"]["reason"]
+    target = describe_configuration_field(config, ["target_npu_device_type"])
+    assert [(i["value"], i["available"]) for i in target["field"]["choices"]] == [("non_a5", True), ("a5", False)]
+    result = describe_configuration_field(config, ["model_overrides", "moe_args", "top_k"], candidates=[1, -1])
+    assert [i["available"] for i in result["field"]["choices"]] == [True, False]
+    assert config.model_overrides is None
+
+
+def test_draft_discovery_rejects_custom_factory_and_imports_without_loading_them(monkeypatch):
+    import pytest
+    from torchtitan_simulator import config as config_module
+    from torchtitan_simulator.config import SimulationConfig
+    from torchtitan_simulator.configuration_metadata import describe_configuration_field
+
+    def unexpected(name):
+        pytest.fail(f"discovery imported an explicit module: {name}")
+
+    monkeypatch.setattr(config_module, "import_module", unexpected)
+    with pytest.raises(ValueError, match="registered preset"):
+        describe_configuration_field(SimulationConfig(config="untrusted.factory"), ["config"])
+    rejected = describe_configuration_field(
+        SimulationConfig(override_imports=["untrusted.module"]),
+        ["config"],
+        candidates=["untrusted.factory"],
+    )
+    assert not rejected["validation"]["valid"] and "explicit override" in rejected["validation"]["reason"]
+    candidate = rejected["field"]["choices"][0]
+    assert not candidate["available"] and "registered preset" in candidate["reason"]
+
+
+def test_capture_dtype_field_distinguishes_build_only_from_capture_preparation():
+    import pytest
+    from torchtitan_simulator.config import SimulationConfig, prepare_capture_config, prepare_config
+    from torchtitan_simulator.configuration_metadata import describe_configuration_field
+
+    config = SimulationConfig(training_dtype="bfloat16")
+    assert prepare_config(config).trainer.training.dtype == "bfloat16"
+    with pytest.raises(ValueError, match=r"DeepSeek V4 capture requires training\.dtype=float32"):
+        prepare_capture_config(config)
+    field = describe_configuration_field(config, ["training_dtype"])
+    choices = {choice["value"]: choice for choice in field["field"]["choices"]}
+    assert not choices["bfloat16"]["available"]
+    assert choices["bfloat16"]["reason"] == field["validation"]["reason"]
+    assert choices["float32"]["available"]
+
+
+def test_tp_candidates_report_dtype_failure_from_unchanged_part_of_draft():
+    from torchtitan_simulator.config import SimulationConfig
+    from torchtitan_simulator.configuration_metadata import describe_configuration_field
+
+    draft = SimulationConfig(world_size=2, training_dtype="bfloat16")
+    report = describe_configuration_field(draft, ["tensor_parallel_degree"], candidates=[1, 2])
+    assert report["validation"]["failed_check"] == "capture_dtype"
+    assert report["validation"]["failed_path"] == ["training_dtype"]
+    for choice in report["field"]["choices"]:
+        assert not choice["available"] and choice["failed_check"] == "capture_dtype"
+        assert choice["failed_path"] == ["training_dtype"]
+        assert "DeepSeek V4 capture requires" in choice["reason"]
+
+
+def test_untagged_native_failure_does_not_blame_probed_field(monkeypatch):
+    from torchtitan_simulator import configuration_metadata
+    from torchtitan_simulator.config import SimulationConfig
+
+    def reject(_):
+        raise ValueError("factory constraint")
+
+    monkeypatch.setattr(configuration_metadata, "prepare_capture_config", reject)
+    report = configuration_metadata.describe_configuration_field(SimulationConfig(), ["seq_len"], candidates=[64])
+    (choice,) = report["field"]["choices"]
+    assert not choice["available"]
+    assert choice["failed_check"] == "native_configuration" and choice["failed_path"] is None
+    assert choice["reason"] == "factory constraint"
