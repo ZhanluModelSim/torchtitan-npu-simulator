@@ -184,7 +184,7 @@ def _check_draft(simulation: SimulationConfig) -> tuple[dict, dict[str, int] | N
         return _rejection(exc.check, str(exc), [exc.field_name] if exc.field_name else None), None
     except (ValueError, TypeError, AssertionError, NotImplementedError) as exc:
         return _rejection("native_configuration", str(exc) or type(exc).__name__), None
-    return {"valid": True, "reason": None}, prepared.batch_configuration
+    return {"valid": True, "reason": None, "failed_check": None, "failed_path": None}, prepared.batch_configuration
 
 
 def _draft_value(simulation: SimulationConfig, path: Sequence[str], value: object) -> SimulationConfig:

@@ -77,7 +77,9 @@ def test_draft_closed_fields_and_nested_geometry_probe_native_combinations():
     result = describe_configuration_field(config, ["activation_checkpoint_mode"])
     modes = {item["value"]: item for item in result["field"]["choices"]}
     assert set(modes) == {"none", "full", "selective"}
+    assert result["validation"] == {"valid": True, "reason": None, "failed_check": None, "failed_path": None}
     assert modes["selective"]["available"]
+    assert modes["selective"]["failed_check"] is None and modes["selective"]["failed_path"] is None
     assert not modes["full"]["available"] and "selective" in modes["full"]["reason"]
     target = describe_configuration_field(config, ["target_npu_device_type"])
     assert [(i["value"], i["available"]) for i in target["field"]["choices"]] == [("non_a5", True), ("a5", False)]
