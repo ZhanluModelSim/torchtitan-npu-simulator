@@ -11,6 +11,35 @@ from torchtitan_simulator.runner import simulate
 from torchtitan_simulator.validation import validate_workload
 
 
+@pytest.mark.parametrize("short_sparse", (False, True), ids=("dense-default", "sparse-opt-in"))
+def test_k3_1_short_capture_uses_causal_native_forward_and_backward(short_sparse):
+    workload = simulate(
+        SimulationConfig(
+            config="kimi_k3_1_smoketest",
+            seq_len=8,
+            kimi_k31_short_sparse=short_sparse,
+        )
+    )
+    by_name = {
+        node.annotations["raw_op_type"]: node
+        for template in workload.step_templates.values()
+        for node in template.nodes.values()
+    }
+    assert "kimi_sim.dsa_indexer.default" not in by_name
+    dense = "npu.npu_fusion_attention_v3.default"
+    sparse = "npu.npu_sparse_flash_attention.default"
+    assert (dense in by_name, sparse in by_name) == (not short_sparse, short_sparse)
+    if short_sparse:
+        facts = dict(by_name[sparse].attrs["attention_geometry"])
+        assert facts["pair_count_source"] == "deterministic_causal_all_keys"
+        assert facts["dense_qk_pairs"] == 64
+        assert facts["effective_qk_pairs"] == 36
+        assert dict(by_name["npu.npu_sparse_flash_attention_grad.default"].attrs["attention_geometry"]) == facts
+    else:
+        assert dict(by_name[dense].attrs["attention_geometry"])["query_lens"] == (8,)
+        assert "npu.npu_fusion_attention_grad_v3.default" in by_name
+
+
 @pytest.mark.parametrize(
     "world,rank,tp,cp,ep,ac",
     [

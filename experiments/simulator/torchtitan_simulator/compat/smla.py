@@ -36,16 +36,19 @@ def install_deepseek_v4_smla_geometry(scope, owner):
             q = getattr(varlen.cu_seq_q, "_sim_host_attention_values", None)
         if q is None:
             return original_attention(module, *args, **kwargs)
-        facts = {"query_lens": _lengths(q)}
+        # Without a packed window the autograd bridge uses cu_seqlens_q for original KV.
+        ori = q
         if metadata.window is not None:
             ori_offsets = metadata.window.cu_seqlens_ori_kv
             ori = getattr(ori_offsets, "_sim_host_attention_values", None)
             if ori is None:
                 return original_attention(module, *args, **kwargs)
-            facts["kv_lens"] = _lengths(ori)
+        facts = {"query_lens": _lengths(q), "kv_lens": _lengths(ori)}
         plan = metadata.plans[module.compress_ratio]
-        cmp = getattr(plan.cu_seqlens_cmp_k, "_sim_host_attention_values", None)
-        if cmp is not None:
+        if plan.cu_seqlens_cmp_k is not None:
+            cmp = getattr(plan.cu_seqlens_cmp_k, "_sim_host_attention_values", None)
+            if cmp is None:
+                return original_attention(module, *args, **kwargs)
             facts["compressed_lens"] = _lengths(cmp)
         token = _forward_geometry.set(facts)
         try:
