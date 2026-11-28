@@ -110,3 +110,43 @@ def test_precision_specific_presets_are_rejected_before_factory_import(preset, p
 def test_cli_rejects_removed_precision_specific_presets_with_migration_guidance(precision):
     with pytest.raises(ValueError, match="Control quantization explicitly"):
         main(["--build-only", "--config", f"deepseek_v4_flash_baseline_{precision}"])
+
+
+@pytest.mark.parametrize(
+    "shard,global_size,expected_ga",
+    [(-1, None, 1), (2, 16, 2)],
+    ids=["native-auto-batch-and-shard", "explicit-batch-and-shard"],
+)
+def test_prepared_batch_resolves_native_sentinels_and_separates_ep(shard, global_size, expected_ga):
+    from torchtitan_simulator.config import prepare_config
+
+    prepared = prepare_config(
+        SimulationConfig(
+            world_size=8,
+            data_parallel_replicate_degree=2,
+            data_parallel_shard_degree=shard,
+            tensor_parallel_degree=2,
+            expert_parallel_degree=2,
+            local_batch_size=2,
+            global_batch_size=global_size,
+        )
+    )
+    assert prepared.batch_configuration == {
+        "data_parallel_replicate_degree": 2,
+        "data_parallel_shard_degree": 2,
+        "data_parallel_degree": 4,
+        "local_batch_size": 2,
+        "global_batch_size": 8 * expected_ga,
+        "gradient_accumulation": expected_ga,
+    }
+
+
+def test_invalid_gbs_rejected_by_prepare_and_execution_before_runtime(monkeypatch):
+    from torchtitan_simulator import runner
+    from torchtitan_simulator.config import prepare_config
+
+    monkeypatch.setattr(runner, "meta_runtime", lambda: pytest.fail("invalid batch entered the runtime"))
+    config = SimulationConfig(world_size=4, local_batch_size=1, global_batch_size=3)
+    for entry in (prepare_config, runner.simulate):
+        with pytest.raises(ValueError, match=r"global_batch_size=3.*local_batch_size=1.*data_parallel_degree=4"):
+            entry(config)

@@ -49,3 +49,74 @@ from torchtitan_simulator.runner import simulate
 assert callable(simulate) and callable(iter_metadata_tensors) and callable(to_meta_metadata)
 """
     subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, text=True)
+
+
+def test_draft_rejects_changed_dp_and_probes_repair_without_mutating_request():
+    from torchtitan_simulator.config import SimulationConfig
+    from torchtitan_simulator.configuration_metadata import describe_configuration_field
+
+    draft = SimulationConfig(world_size=4, local_batch_size=1, global_batch_size=2)
+    query = describe_configuration_field(draft, ["tensor_parallel_degree"], candidates=[1, 2, True])
+    assert query["batch_configuration"] is None
+    assert not query["validation"]["valid"]
+    assert "global_batch_size=2" in query["validation"]["reason"]
+    current, repaired, wrong_type = query["field"]["choices"]
+    assert not current["available"] and current["reason"] == query["validation"]["reason"]
+    assert repaired["available"] and repaired["reason"] is None
+    assert not wrong_type["available"] and "integer" in wrong_type["reason"]
+    assert draft.tensor_parallel_degree == 1
+
+
+def test_draft_closed_fields_and_nested_geometry_probe_native_combinations():
+    from torchtitan_simulator.config import SimulationConfig
+    from torchtitan_simulator.configuration_metadata import describe_configuration_field
+
+    config = SimulationConfig(selective_ac_save_ops=["comm"], activation_checkpoint_mode="selective")
+    result = describe_configuration_field(config, ["activation_checkpoint_mode"])
+    modes = {item["value"]: item for item in result["field"]["choices"]}
+    assert set(modes) == {"none", "full", "selective"}
+    assert modes["selective"]["available"]
+    assert not modes["full"]["available"] and "selective" in modes["full"]["reason"]
+    target = describe_configuration_field(config, ["target_npu_device_type"])
+    assert [(i["value"], i["available"]) for i in target["field"]["choices"]] == [("non_a5", True), ("a5", False)]
+    result = describe_configuration_field(config, ["model_overrides", "moe_args", "top_k"], candidates=[1, -1])
+    assert [i["available"] for i in result["field"]["choices"]] == [True, False]
+    assert config.model_overrides is None
+
+
+def test_draft_discovery_rejects_custom_factory_and_imports_without_loading_them(monkeypatch):
+    import pytest
+    from torchtitan_simulator import config as config_module
+    from torchtitan_simulator.config import SimulationConfig
+    from torchtitan_simulator.configuration_metadata import describe_configuration_field
+
+    def unexpected(name):
+        pytest.fail(f"discovery imported an explicit module: {name}")
+
+    monkeypatch.setattr(config_module, "import_module", unexpected)
+    with pytest.raises(ValueError, match="registered preset"):
+        describe_configuration_field(SimulationConfig(config="untrusted.factory"), ["config"])
+    rejected = describe_configuration_field(
+        SimulationConfig(override_imports=["untrusted.module"]),
+        ["config"],
+        candidates=["untrusted.factory"],
+    )
+    assert not rejected["validation"]["valid"] and "explicit override" in rejected["validation"]["reason"]
+    candidate = rejected["field"]["choices"][0]
+    assert not candidate["available"] and "registered preset" in candidate["reason"]
+
+
+def test_capture_dtype_field_distinguishes_build_only_from_capture_preparation():
+    import pytest
+    from torchtitan_simulator.config import SimulationConfig, prepare_capture_config, prepare_config
+    from torchtitan_simulator.configuration_metadata import describe_configuration_field
+
+    config = SimulationConfig(training_dtype="bfloat16")
+    assert prepare_config(config).trainer.training.dtype == "bfloat16"
+    with pytest.raises(ValueError, match=r"DeepSeek V4 capture requires training\.dtype=float32"):
+        prepare_capture_config(config)
+    field = describe_configuration_field(config, ["training_dtype"])
+    choices = {choice["value"]: choice for choice in field["field"]["choices"]}
+    assert not choices["bfloat16"]["available"]
+    assert choices["bfloat16"]["reason"] == field["validation"]["reason"]
+    assert choices["float32"]["available"]

@@ -18,7 +18,7 @@ from torchtitan_simulator.capture.op_mapping import communication_primitive
 from torchtitan_simulator.compat.checkpoint import logical_named_parameters
 from torchtitan_simulator.compat.distributed import logical_world
 from torchtitan_simulator.compat.routing import install_balanced_dispatch
-from torchtitan_simulator.config import build_meta_model, prepare_config
+from torchtitan_simulator.config import build_meta_model, prepare_capture_config
 from torchtitan_simulator.host_timing import HostTimings
 from torchtitan_simulator.meta_env import compute_block
 from torchtitan_simulator.metadata import to_meta_metadata
@@ -168,28 +168,7 @@ def simulate(simulation):
 
 def _simulate(simulation, timings: HostTimings):
     with timings.measure("configuration"):
-        prepared = prepare_config(simulation)
-    if prepared.trainer.model_spec.name == "deepseek_v4" and prepared.trainer.training.dtype != "float32":
-        raise ValueError(
-            "DeepSeek V4 capture requires training.dtype=float32: native FSDP expects uniform original "
-            "parameter dtype, but base bfloat16 mixes with explicit float32 attn_sink/ape parameters. "
-            "Use mixed_precision_param=bfloat16 for native BF16 compute, or memory_parameter_storage_dtype "
-            "for a storage-only estimate. Build-only can still inspect the native bfloat16 model."
-        )
-    if prepared.trainer.model_spec.name in {"kimi_k3", "kimi_k3_1"} and prepared.trainer.training.dtype != "float32":
-        raise ValueError(
-            "Kimi K3/K3.1 capture requires training.dtype=float32: native FSDP expects uniform original "
-            "parameter dtype, "
-            "but the model defines A_log/dt_bias in float32. Use mixed_precision_param=bfloat16 for BF16 compute, "
-            "or memory_parameter_storage_dtype for a storage-only estimate. Build-only can inspect bfloat16."
-        )
-    if prepared.trainer.model_spec.name in {"qwen3", "qwen3_5"} and prepared.trainer.training.dtype != "float32":
-        raise ValueError(
-            "Qwen3/Qwen3.5 capture requires training.dtype=float32: the fused AdamW gradient manifest and the "
-            "static memory accounting are validated for FP32 original parameters only (capability matrix). "
-            "Use mixed_precision_param=bfloat16 for BF16 compute, or memory_parameter_storage_dtype "
-            "for a storage-only estimate."
-        )
+        prepared = prepare_capture_config(simulation)
     simulation = prepared.simulation
     config = prepared.trainer
     with meta_runtime() as runtime:
@@ -266,14 +245,9 @@ def _simulate(simulation, timings: HostTimings):
             scheduler = config.lr_scheduler.build(optimizers=optimizers, training_steps=config.training.steps)
 
             seq_len = simulation.seq_len
-            batch_size = config.training.local_batch_size
-            batch_degree = dims.dp_replicate * dims.dp_shard
-            global_batch_size = config.training.global_batch_size
-            if global_batch_size < 0:
-                global_batch_size = batch_size * batch_degree
-            if global_batch_size < 1 or global_batch_size % (batch_size * batch_degree):
-                raise ValueError("Global batch size must be a positive multiple of local batch size * DP degree")
-            gradient_accumulation = global_batch_size // (batch_size * batch_degree)
+            batch_size = prepared.batch.local_batch_size
+            batch_degree = prepared.batch.data_parallel_degree
+            gradient_accumulation = prepared.batch.gradient_accumulation
             source = torch.arange(batch_size * (seq_len + 1)).reshape(batch_size, seq_len + 1)
             source %= config.model_spec.model.vocab_size
             tokens, labels = source[:, :-1].contiguous(), source[:, 1:].contiguous()
@@ -429,10 +403,7 @@ def _simulate(simulation, timings: HostTimings):
                     logging.getLogger(__name__).warning(message)
                     prepared.adaptations.append(message)
             annotations["batch_configuration"] = {
-                "global_batch_size": global_batch_size,
-                "local_batch_size": batch_size,
-                "data_parallel_degree": batch_degree,
-                "gradient_accumulation": gradient_accumulation,
+                **prepared.batch_configuration,
                 "captured_microbatches": 1,
                 "global_valid_tokens": valid_tokens * batch_degree * gradient_accumulation,
                 "memory_scope": (

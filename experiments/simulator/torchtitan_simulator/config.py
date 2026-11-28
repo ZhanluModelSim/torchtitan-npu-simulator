@@ -8,13 +8,22 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from importlib import import_module
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from torchtitan_simulator.model_overrides import ModelOverrides
     from torchtitan_simulator.selective_ac import SelectiveACSaveOp
+
+
+PRECISION_CHOICES = {
+    "training_dtype": ("float32", "bfloat16"),
+    "mixed_precision_param": ("float32", "bfloat16"),
+    "mixed_precision_reduce": ("float32",),
+}
+ACTIVATION_CHECKPOINT_MODES = ("none", "full", "selective")
+TARGET_NPU_DEVICE_TYPES = ("non_a5", "a5")
 
 
 @dataclass(kw_only=True)
@@ -81,11 +90,7 @@ class SimulationConfig:
                 "(CLI: --extension.quantization.enable-quantized-training); "
                 "it is disabled by default."
             )
-        for name, choices in (
-            ("training_dtype", {"float32", "bfloat16"}),
-            ("mixed_precision_param", {"float32", "bfloat16"}),
-            ("mixed_precision_reduce", {"float32"}),
-        ):
+        for name, choices in PRECISION_CHOICES.items():
             value = getattr(self, name)
             if value is not None and value not in choices:
                 raise ValueError(f"{name} must be one of {sorted(choices)}")
@@ -93,7 +98,7 @@ class SimulationConfig:
             self.model_overrides.validate()
         if self.quantization_recipe != "all_mxfp8":
             raise ValueError("This simulator stage supports only the native all_mxfp8 quantization recipe")
-        if self.activation_checkpoint_mode not in {"none", "full", "selective"}:
+        if self.activation_checkpoint_mode not in ACTIVATION_CHECKPOINT_MODES:
             raise ValueError("activation_checkpoint_mode must be none, full, or selective")
         if self.selective_ac_save_ops is not None:
             from torchtitan_simulator.selective_ac import _validate_selection
@@ -101,8 +106,25 @@ class SimulationConfig:
             if self.activation_checkpoint_mode != "selective":
                 raise ValueError("selective_ac_save_ops requires selective activation checkpointing")
             _validate_selection(self.selective_ac_save_ops)
-        if any(value is not None and value < 1 for value in (self.local_batch_size, self.global_batch_size)):
-            raise ValueError("Explicit batch sizes must be positive")
+        for name in (
+            "world_size",
+            "logical_rank",
+            "seq_len",
+            "num_mtp_modules",
+            "pipeline_parallel_degree",
+            "data_parallel_replicate_degree",
+            "data_parallel_shard_degree",
+            "tensor_parallel_degree",
+            "context_parallel_degree",
+            "expert_parallel_degree",
+        ):
+            if type(getattr(self, name)) is not int:
+                raise ValueError(f"{name} must be an integer")
+        if any(
+            value is not None and (type(value) is not int or value < 1)
+            for value in (self.local_batch_size, self.global_batch_size)
+        ):
+            raise ValueError("Explicit batch sizes must be positive integers")
         if self.memory_parameter_storage_dtype:
             from torchtitan_simulator.capture.tensor_utils import normalize_supported_dtype
 
@@ -115,7 +137,7 @@ class SimulationConfig:
             raise ValueError("world_size/seq_len must be positive; num_mtp_modules must be nonnegative")
         if self.enable_fsdp_allgather_fp8 or self.enable_ep_dispatch_fp8:
             raise ValueError("FP8 communication modeling is deferred; disable FP8 all-gather and EP dispatch")
-        if self.target_npu_device_type not in {"non_a5", "a5"}:
+        if self.target_npu_device_type not in TARGET_NPU_DEVICE_TYPES:
             raise ValueError("target_npu_device_type must be 'non_a5' or 'a5'")
         unknown = set(self.output_formats) - {"mem"}
         if unknown:
@@ -140,12 +162,49 @@ class SimulationConfig:
             raise ValueError("EP must divide DP shard * TP * CP")
 
 
+@dataclass(frozen=True)
+class TrainingBatch:
+    local_batch_size: int
+    global_batch_size: int
+    data_parallel_replicate_degree: int
+    data_parallel_shard_degree: int
+    data_parallel_degree: int
+    gradient_accumulation: int
+
+    @classmethod
+    def from_trainer(cls, trainer: Any, world_size: int) -> TrainingBatch:
+        from torchtitan.distributed import ParallelDims
+
+        # This resolves the native -1 shard sentinel without constructing a mesh.
+        dims = ParallelDims.from_config(trainer.parallelism, world_size)
+        degree = dims.dp_replicate * dims.dp_shard
+        local = trainer.training.local_batch_size
+        global_size = trainer.training.global_batch_size
+        if type(local) is not int or local < 1 or type(global_size) is not int:
+            raise ValueError("Native batch sizes must be integers and local_batch_size must be positive")
+        minimum = local * degree
+        if global_size < 0:
+            global_size = minimum
+        if global_size < 1 or global_size % minimum:
+            raise ValueError(
+                f"global_batch_size={global_size} must be a positive multiple of local_batch_size={local} "
+                f"* data_parallel_degree={degree} ({dims.dp_replicate} replicas * {dims.dp_shard} shards); "
+                f"the batch per microstep is {minimum}"
+            )
+        return cls(local, global_size, dims.dp_replicate, dims.dp_shard, degree, global_size // minimum)
+
+
 @dataclass
 class PreparedConfig:
     simulation: SimulationConfig
     trainer: Any
     config_factory: str
     adaptations: list[str]
+    batch: TrainingBatch
+
+    @property
+    def batch_configuration(self) -> dict[str, int]:
+        return asdict(self.batch)
 
 
 _COMMON_OVERRIDES = [
@@ -385,14 +444,42 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
 
     adaptations.extend(apply_overrides(trainer.override, trainer))
     _prepare_optimizer(simulation, trainer)
-    for name, choices in (
-        ("dtype", {"float32", "bfloat16"}),
-        ("mixed_precision_param", {"float32", "bfloat16"}),
-        ("mixed_precision_reduce", {"float32"}),
-    ):
+    for source, choices in PRECISION_CHOICES.items():
+        name = "dtype" if source == "training_dtype" else source
         if getattr(trainer.training, name) not in choices:
             raise ValueError(f"Native training.{name} must be one of {sorted(choices)}")
-    return PreparedConfig(simulation, trainer, target, adaptations)
+    batch = TrainingBatch.from_trainer(trainer, simulation.world_size)
+    return PreparedConfig(simulation, trainer, target, adaptations, batch)
+
+
+def prepare_capture_config(simulation: SimulationConfig) -> PreparedConfig:
+    """Prepare the configuration and reject known capture-only restrictions before model construction."""
+    from torchtitan_simulator.compat.target import validate_target_selection
+
+    prepared = prepare_config(simulation)
+    validate_target_selection(simulation.target_npu_device_type)
+    if prepared.trainer.model_spec.name == "deepseek_v4" and prepared.trainer.training.dtype != "float32":
+        raise ValueError(
+            "DeepSeek V4 capture requires training.dtype=float32: native FSDP expects uniform original "
+            "parameter dtype, but base bfloat16 mixes with explicit float32 attn_sink/ape parameters. "
+            "Use mixed_precision_param=bfloat16 for native BF16 compute, or memory_parameter_storage_dtype "
+            "for a storage-only estimate. Build-only can still inspect the native bfloat16 model."
+        )
+    if prepared.trainer.model_spec.name in {"kimi_k3", "kimi_k3_1"} and prepared.trainer.training.dtype != "float32":
+        raise ValueError(
+            "Kimi K3/K3.1 capture requires training.dtype=float32: native FSDP expects uniform original "
+            "parameter dtype, "
+            "but the model defines A_log/dt_bias in float32. Use mixed_precision_param=bfloat16 for BF16 compute, "
+            "or memory_parameter_storage_dtype for a storage-only estimate. Build-only can inspect bfloat16."
+        )
+    if prepared.trainer.model_spec.name in {"qwen3", "qwen3_5"} and prepared.trainer.training.dtype != "float32":
+        raise ValueError(
+            "Qwen3/Qwen3.5 capture requires training.dtype=float32: the fused AdamW gradient manifest and the "
+            "static memory accounting are validated for FP32 original parameters only (capability matrix). "
+            "Use mixed_precision_param=bfloat16 for BF16 compute, or memory_parameter_storage_dtype "
+            "for a storage-only estimate."
+        )
+    return prepared
 
 
 def build_meta_model(prepared: PreparedConfig):

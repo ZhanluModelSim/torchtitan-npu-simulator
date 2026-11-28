@@ -9,9 +9,13 @@ import sys
 from importlib import import_module
 
 
-def install_target_selection(scope, target):
+def validate_target_selection(target: str) -> None:
     if target != "non_a5":
         raise ValueError("A5 backend acceptance is pending; this runtime currently verifies non_a5")
+
+
+def install_target_selection(scope, target):
+    validate_target_selection(target)
     owner = import_module("torchtitan_npu.override")
     if not hasattr(owner, "_IS_A5"):
         raise RuntimeError("Native override device selection contract requires review")
