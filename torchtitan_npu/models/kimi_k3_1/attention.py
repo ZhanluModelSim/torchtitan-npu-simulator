@@ -23,6 +23,17 @@ class KimiGatedDSA(KimiGatedMLA):
         super().__init__(config)
         self.indexer = config.indexer.build()
 
+    def _absorbed_attention(self, q_nope, q_rope, latent, k_rope, indices, kernel):
+        """Move the two KV projections across attention without forming full-head KV."""
+        weights = self.kv_b_proj.weight.reshape(
+            self.num_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank
+        )
+        key_proj, value_proj = weights.split((self.qk_nope_head_dim, self.v_head_dim), dim=1)
+        absorbed_q = torch.einsum("bshd,hdr->bshr", q_nope, key_proj)
+        attended = kernel(absorbed_q, latent.unsqueeze(2), q_rope, k_rope.unsqueeze(2), indices)
+        output = torch.einsum("bshr,hdr->bshd", attended, value_proj)
+        return output.transpose(1, 2)
+
     def _compute_attention(
         self,
         hidden_states: torch.Tensor,

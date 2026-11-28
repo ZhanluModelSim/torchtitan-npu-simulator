@@ -3,17 +3,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Meta-only selected-key boundaries for K3.1, without changing device execution.
-
-Q/K/V remain expanded per head, unlike absorbed inference DSA. A custom contract
-keeps value width separate from score width and saves output/LSE for backward;
-the legacy dense attention boundary has neither of these sparse contracts.
-"""
-
-import math
+"""Capture Kimi K3.1 absorbed SFA and its independent learned indexer."""
 
 import torch
+from torch.nn import functional as F
 
+from torchtitan_simulator.capture.dispatch_capture import capture_attention_geometry
 from torchtitan_simulator.capture.tensor_semantics import (
     OperatorTensorSemantics,
     TensorMeaning,
@@ -39,84 +34,7 @@ def _indexer_meta(q, k, weights, topk):
     return torch.empty((*q.shape[:2], min(q.shape[1], topk)), dtype=torch.int64, device=q.device)
 
 
-def _validate_attention(q, k, v, indices):
-    if q.ndim != 4 or k.shape != q.shape or v.shape[:-1] != q.shape[:-1]:
-        raise ValueError("DSA attention requires equal B/H/S dimensions with distinct QK/V widths")
-    if min((*q.shape, v.shape[-1])) <= 0 or q.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-        raise ValueError("DSA attention requires positive floating-point geometry")
-    if indices.ndim != 3 or indices.shape[:2] != (q.shape[0], q.shape[2]):
-        raise ValueError("DSA indices must be B/S/K")
-    if not 0 < indices.shape[2] <= q.shape[2] or indices.dtype != torch.int64:
-        raise ValueError("DSA indices require positive bounded width and int64 storage")
-    if len({t.dtype for t in (q, k, v)}) != 1 or len({t.device for t in (q, k, v, indices)}) != 1:
-        raise ValueError("DSA attention tensors must share dtype and placement")
-
-
-@torch.library.custom_op("kimi_sim::dsa_attention", mutates_args=())
-def dsa_attention(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, indices: torch.Tensor, scale: float
-) -> tuple[torch.Tensor, torch.Tensor]:
-    raise RuntimeError("Kimi virtual selected attention is available only for Meta simulation")
-
-
-@dsa_attention.register_fake
-def _attention_meta(q, k, v, indices, scale):
-    _validate_attention(q, k, v, indices)
-    if not math.isfinite(scale) or scale <= 0:
-        raise ValueError("DSA attention requires finite positive scale")
-    out = torch.empty((*q.shape[:-1], v.shape[-1]), dtype=v.dtype, device=v.device)
-    lse = torch.empty(q.shape[:-1], dtype=torch.float32, device=q.device)
-    return out, lse
-
-
-@torch.library.custom_op("kimi_sim::dsa_attention_grad", mutates_args=())
-def dsa_attention_grad(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    indices: torch.Tensor,
-    out: torch.Tensor,
-    lse: torch.Tensor,
-    dy: torch.Tensor,
-    scale: float,
-) -> list[torch.Tensor]:
-    raise RuntimeError("Kimi virtual selected attention gradient is available only for Meta simulation")
-
-
-@dsa_attention_grad.register_fake
-def _attention_grad_meta(q, k, v, indices, out, lse, dy, scale):
-    _validate_attention(q, k, v, indices)
-    if not math.isfinite(scale) or scale <= 0:
-        raise ValueError("DSA attention requires finite positive scale")
-    if out.shape != (*q.shape[:-1], v.shape[-1]) or dy.shape != out.shape or lse.shape != q.shape[:-1]:
-        raise ValueError("DSA saved output, LSE and output gradient disagree with the forward contract")
-    if out.dtype != v.dtype or dy.dtype != out.dtype or lse.dtype != torch.float32:
-        raise ValueError("DSA saved output and LSE dtypes disagree with forward")
-    if any(t.device != q.device for t in (out, lse, dy)):
-        raise ValueError("DSA saved tensors and output gradient must share placement")
-    return [torch.empty_like(t) for t in (q, k, v)]
-
-
-def _attention_setup(ctx, inputs, output):
-    q, k, v, indices, ctx.scale = inputs
-    out, lse = output
-    ctx.save_for_backward(q, k, v, indices, out, lse)
-    ctx.mark_non_differentiable(lse)
-
-
-def _attention_backward(ctx, dy, unused_lse_gradient):
-    return (*dsa_attention_grad(*ctx.saved_tensors, dy, ctx.scale), None, None)
-
-
-dsa_attention.register_autograd(_attention_backward, setup_context=_attention_setup)
-
-_Q = TensorMeaning("query", ("batch", "head", "q_len", "qk_head_dim"))
-_K = TensorMeaning("key", ("batch", "head", "kv_len", "qk_head_dim"))
-_V = TensorMeaning("value", ("batch", "head", "kv_len", "value_head_dim"))
 _INDICES = TensorMeaning("selected_indices", ("batch", "q_len", "selected_key"))
-_OUT = TensorMeaning("attention_output", ("batch", "head", "q_len", "value_head_dim"))
-_LSE = TensorMeaning("logsumexp", ("batch", "head", "q_len"))
-_INPUTS = (("q", _Q), ("k", _K), ("v", _V), ("indices", _INDICES))
 register_tensor_semantics(
     str(dsa_indexer._opoverload),
     OperatorTensorSemantics(
@@ -128,30 +46,120 @@ register_tensor_semantics(
         (_INDICES,),
     ),
 )
-register_tensor_semantics(str(dsa_attention._opoverload), OperatorTensorSemantics(_INPUTS, (_OUT, _LSE)))
-register_tensor_semantics(
-    str(dsa_attention_grad._opoverload),
-    OperatorTensorSemantics(
-        (*_INPUTS, ("out", _OUT), ("lse", _LSE), ("dy", TensorMeaning("output_gradient", _OUT.axes))),
-        tuple(
-            TensorMeaning(role + "_gradient", meaning.axes)
-            for role, meaning in (("query", _Q), ("key", _K), ("value", _V))
-        ),
-    ),
-)
 
 
-def install_kimi_dsa_virtual_fusions(scope):
-    """Scope only selection/core, leaving projections and normalizations visible."""
-    from torchtitan_npu.models.kimi_k3_1 import attention as owner
+class _NativeSparseMetaAutograd(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, kv, qr, kr, indices, lengths, scale, facts):
+        with capture_attention_geometry("npu.npu_sparse_flash_attention.default", **facts):
+            out, maximum, normalizer = torch.ops.npu.npu_sparse_flash_attention(
+                q,
+                kv,
+                kv,
+                indices,
+                scale,
+                actual_seq_lengths_query=lengths,
+                actual_seq_lengths_kv=lengths,
+                query_rope=qr,
+                key_rope=kr,
+                attention_mode=2,
+                return_softmax_lse=True,
+            )
+        ctx.save_for_backward(q, kv, qr, kr, indices, lengths, out, maximum, normalizer)
+        ctx.scale = scale
+        ctx.facts = facts
+        return out
+
+    @staticmethod
+    def backward(ctx, dy):
+        q, kv, qr, kr, indices, lengths, out, maximum, normalizer = ctx.saved_tensors
+        with capture_attention_geometry("npu.npu_sparse_flash_attention_grad.default", **ctx.facts):
+            dq, dk, dv, dqr, dkr = torch.ops.npu.npu_sparse_flash_attention_grad(
+                q,
+                kv,
+                kv,
+                indices,
+                dy.contiguous(),
+                out,
+                maximum,
+                normalizer,
+                ctx.scale,
+                1,
+                query_rope=qr,
+                key_rope=kr,
+                actual_seq_qlen=lengths,
+                actual_seq_kvlen=lengths,
+                attention_mode=2,
+            )
+        return dq, dk + dv, dqr, dkr, None, None, None, None
+
+
+def _native_sparse(q, kv, qr, kr, indices, scale, topk, source):
+    batch, seq, heads, _ = q.shape
+    padded_heads = 1 << (heads - 1).bit_length()
+    width = max(1024, 1 << (indices.shape[-1] - 1).bit_length())
+    indices = F.pad(indices.to(torch.int32).unsqueeze(2), (0, width - indices.shape[-1]), value=-1)
+    if padded_heads != heads:
+        q = F.pad(q, (0, 0, 0, padded_heads - heads))
+        qr = F.pad(qr, (0, 0, 0, padded_heads - heads))
+    lengths = torch.full((batch,), seq, dtype=torch.int32, device=q.device)
+    per_request = sum(min(i, topk) for i in range(1, seq + 1))
+    facts = {
+        "query_lens": (seq,) * batch,
+        "kv_lens": (seq,) * batch,
+        "dense_qk_pairs": batch * seq * seq,
+        "effective_qk_pairs": batch * per_request,
+        "selected_pairs_by_request": (per_request,) * batch,
+        "pair_count_source": source,
+        "logical_q_heads": heads,
+        "shared_key_value": True,
+    }
+    output = _NativeSparseMetaAutograd.apply(
+        q.contiguous(),
+        kv.contiguous(),
+        qr.contiguous(),
+        kr.contiguous(),
+        indices.contiguous(),
+        lengths,
+        scale,
+        facts,
+    )
+    return output[:, :, :heads]
+
+
+def install_kimi_dsa_native_capture(scope, *, short_sparse: bool = False):
+    """Use the native absorbed SFA boundary for Meta training captures."""
+    import spmd_types
+
+    from torchtitan_npu.models.kimi_k3_1.attention import KimiGatedDSA
     from torchtitan_npu.models.kimi_k3_1.dsa import KimiDSAIndexer
+
+    spmd_types.register_local_autograd_function(_NativeSparseMetaAutograd)
+    original = KimiGatedDSA._project_attention
 
     def select(module, queries, keys, weights):
         return dsa_indexer(queries, keys, weights, module.topk)
 
-    def selected_attention(query, key, value, indices, scale):
-        out, _ = dsa_attention(query, key, value, indices, scale)
-        return out
+    def project(module, hidden, query_latent, q_nope, q_rope, latent, k_rope):
+        batch, seq = hidden.shape[:2]
+        topk = module.indexer.topk
+        if seq <= topk and not short_sparse:
+            return original(module, hidden, query_latent, q_nope, q_rope, latent, k_rope)
+        if seq <= topk:
+            positions = torch.arange(seq, device=hidden.device, dtype=torch.int32)
+            indices = positions.expand(batch, seq, seq).masked_fill(positions > positions[:, None], -1)
+            source = "deterministic_causal_all_keys"
+        else:
+            indices = module.indexer(hidden, query_latent)
+            source = "causal_learned_topk"
+        return module._absorbed_attention(
+            q_nope,
+            q_rope,
+            latent,
+            k_rope,
+            indices,
+            lambda q, kv, qr, kr, idx: _native_sparse(q, kv, qr, kr, idx, module.scaling, topk, source),
+        )
 
     scope.replace(KimiDSAIndexer, "_select", select)
-    scope.replace(owner, "selected_key_attention", selected_attention)
+    scope.replace(KimiGatedDSA, "_project_attention", project)

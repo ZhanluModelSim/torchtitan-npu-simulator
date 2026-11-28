@@ -336,18 +336,9 @@ class KimiGatedMLA(_FullContextAttention):
         # KV
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
         k_compressed, k_rope = torch.split(compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kv = self.kv_b_proj(self.kv_a_layernorm(k_compressed))
-        kv = kv.view(batch_size, seq_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-        k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-
-        # Kimi K3 sets mla_use_nope=True, so the legacy q_rope/k_rope slices
-        # participate in attention without rotary position encoding.
-        k_rope_expanded = k_rope.unsqueeze(2).expand(-1, -1, self.num_heads, -1)
-
-        query = torch.cat([q_nope, q_rope], dim=-1)
-        key = torch.cat([k_nope, k_rope_expanded], dim=-1)
-
-        attn_output = self._compute_attention(hidden_states, query_latent, query, key, v)
+        attn_output = self._project_attention(
+            hidden_states, query_latent, q_nope, q_rope, self.kv_a_layernorm(k_compressed), k_rope
+        )
         attn_output = attn_output.transpose(1, 2)  # (B, S, H, D)
 
         # Trim padding
@@ -361,6 +352,17 @@ class KimiGatedMLA(_FullContextAttention):
         attn_output = attn_output * gate
 
         return self.o_proj(self._local_context(attn_output))
+
+    def _project_attention(self, hidden_states, query_latent, q_nope, q_rope, latent, k_rope):
+        """Project the latent bank when the selected attention core needs expanded K/V."""
+        batch, seq_len = hidden_states.shape[:2]
+        kv = self.kv_b_proj(latent)
+        kv = kv.view(batch, seq_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+        k_nope, value = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        # Kimi uses these channels without rotary position encoding.
+        query = torch.cat((q_nope, q_rope), dim=-1)
+        key = torch.cat((k_nope, k_rope.unsqueeze(2).expand(-1, -1, self.num_heads, -1)), dim=-1)
+        return self._compute_attention(hidden_states, query_latent, query, key, value)
 
     def _compute_attention(
         self,

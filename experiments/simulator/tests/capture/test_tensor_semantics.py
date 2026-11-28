@@ -10,52 +10,32 @@ import json
 import pytest
 import torch
 from torchtitan_simulator.capture.dispatch_capture import OpDispatchCapture
-from torchtitan_simulator.compat.kimi import chunk_kda, fusion_attention, situ_glu
+from torchtitan_simulator.compat.kimi import chunk_kda, situ_glu
 
 
-def test_attention_forward_backward_expose_roles_and_distinct_sequence_axes():
-    query = torch.empty(2, 3, 5, 7, device="meta", requires_grad=True)
-    key = torch.empty(2, 3, 11, 7, device="meta", requires_grad=True)
+def test_native_attention_preserves_named_bindings_and_distinct_sequence_lengths():
+    pytest.importorskip("torch_npu")
+    from torchtitan_simulator.compat.attention import causal_fusion_attention_v3
+
+    query = torch.empty(2, 4, 5, 64, device="meta", dtype=torch.bfloat16, requires_grad=True)
+    key = torch.empty(2, 2, 11, 64, device="meta", dtype=torch.bfloat16, requires_grad=True)
     value = torch.empty_like(key, requires_grad=True)
     capture = OpDispatchCapture(record_memory=False)
-
     with capture:
-        output = fusion_attention(query, key, value, 0.5)
+        output = causal_fusion_attention_v3(query, key, value)
         output.backward(torch.empty_like(output))
 
     nodes = {node.annotations["raw_op_type"]: node for node in capture.build_nodes().values()}
-    forward = nodes["kimi_sim.fusion_attention.default"]
-    backward = nodes["kimi_sim.fusion_attention_grad.default"]
-    expected_inputs = (
-        {"index": 0, "role": "query", "axes": ("batch", "head", "q_len", "qk_head_dim")},
-        {"index": 1, "role": "key", "axes": ("batch", "head", "kv_len", "qk_head_dim")},
-        {"index": 2, "role": "value", "axes": ("batch", "head", "kv_len", "padded_value_head_dim")},
-    )
-    assert forward.attrs["tensor_semantics"] == {
-        "version": 1,
-        "inputs": expected_inputs,
-        "outputs": (
-            {"index": 0, "role": "attention_output", "axes": ("batch", "head", "q_len", "padded_value_head_dim")},
-        ),
-    }
-    assert forward.inputs[0].shape == (2, 3, 5, 7)
-    assert forward.inputs[1].shape == (2, 3, 11, 7)
-    assert backward.attrs["tensor_semantics"]["inputs"] == (
-        *expected_inputs,
-        {"index": 3, "role": "output_gradient", "axes": ("batch", "head", "q_len", "padded_value_head_dim")},
-    )
-    assert [item["role"] for item in backward.attrs["tensor_semantics"]["outputs"]] == [
-        "query_gradient",
-        "key_gradient",
-        "value_gradient",
-    ]
-    assert [item["axes"] for item in backward.attrs["tensor_semantics"]["outputs"]] == [
-        ("batch", "head", "q_len", "qk_head_dim"),
-        ("batch", "head", "kv_len", "qk_head_dim"),
-        ("batch", "head", "kv_len", "padded_value_head_dim"),
-    ]
-    assert all("tensor_semantics" not in node.attrs for raw, node in nodes.items() if raw.startswith("aten."))
-    json.dumps(forward.attrs["tensor_semantics"], allow_nan=False)
+    forward = nodes["npu.npu_fusion_attention_v3.default"]
+    backward = nodes["npu.npu_fusion_attention_grad_v3.default"]
+    facts = {"query_lens": (5, 5), "kv_lens": (11, 11)}
+    assert dict(forward.attrs["attention_geometry"]) == dict(backward.attrs["attention_geometry"]) == facts
+    bindings = dict(forward.attrs["input_tensor_bindings"])
+    assert forward.inputs[bindings["query"]].shape == query.shape
+    assert forward.inputs[bindings["key"]].shape == key.shape
+    assert forward.inputs[bindings["value"]].shape == value.shape
+    assert [gradient.shape for gradient in backward.outputs[:3]] == [query.shape, key.shape, value.shape]
+    json.dumps(facts, allow_nan=False)
 
 
 def test_kda_backward_retains_parameter_axes_and_flattened_bias_axis():
@@ -122,22 +102,22 @@ def test_roles_follow_keyword_occurrences_even_when_the_same_tensor_is_reused():
     capture = OpDispatchCapture(record_memory=False)
 
     capture.__torch_dispatch__(
-        torch.ops.kimi_sim.fusion_attention.default, (), (), {"v": tensor, "q": tensor, "k": tensor, "scale": 0.5}
+        torch.ops.kimi_sim.situ_glu.default, (), (), {"up": tensor, "gate": tensor, "beta": 4.0, "linear_beta": None}
     )
 
     (node,) = capture.build_nodes().values()
     assert [(item["index"], item["role"]) for item in node.attrs["tensor_semantics"]["inputs"]] == [
-        (0, "value"),
-        (1, "query"),
-        (2, "key"),
+        (0, "up"),
+        (1, "gate"),
     ]
-    assert len(node.inputs) == 3
+    assert len(node.inputs) == 2
 
 
-def test_declared_attention_rank_mismatch_is_not_silently_labelled():
-    tensor = torch.empty(2, 3, 7, device="meta")
+def test_declared_kda_rank_mismatch_is_not_silently_labelled():
+    shapes = [(2, 3, 7)] + [(2, 5, 3, 7)] * 3 + [(2, 5, 3), (3,), (21,)]
+    inputs = [torch.empty(shape, device="meta") for shape in shapes]
     with OpDispatchCapture(record_memory=False), pytest.raises(ValueError, match=r"Tensor role 'query'.*got shape"):
-        fusion_attention(tensor, tensor, tensor, 0.5)
+        chunk_kda(*inputs, -5.0)
 
 
 @pytest.mark.parametrize("with_scales", [False, True], ids=["unweighted", "weighted"])

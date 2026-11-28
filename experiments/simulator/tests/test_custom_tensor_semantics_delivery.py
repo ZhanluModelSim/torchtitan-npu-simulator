@@ -56,15 +56,30 @@ def test_real_training_delivers_custom_semantics_with_local_shapes(config, world
     assert reroute.inputs[1].shape == (2, 2 if config.startswith("deepseek") else 4)
     if config.startswith("kimi"):
         attention = next(
-            node for node in custom if node.annotations["raw_op_type"] == "kimi_sim.fusion_attention.default"
+            node for node in nodes if node.annotations["raw_op_type"] == "npu.npu_fusion_attention_v3.default"
         )
-        assert attention.attrs["tensor_semantics"]["inputs"][0] == {
-            "index": 0,
-            "role": "query",
-            "axes": ("batch", "head", "q_len", "qk_head_dim"),
-        }
-        assert attention.inputs[0].shape == (1, 8 // tp, 16, 32)
-        assert attention.inputs[2].shape[-1] == 32  # V head width 16 is padded at this boundary.
-        (tmp_path / "attention-semantics.json").write_text(
-            json.dumps({"shape": attention.inputs[0].shape, **attention.attrs["tensor_semantics"]}, indent=2)
-        )
+        bindings = dict(attention.attrs["input_tensor_bindings"])
+        geometry = dict(attention.attrs["attention_geometry"])
+        assert attention.inputs[bindings["query"]].shape == (1, 8 // tp, 16, 32)
+        assert attention.inputs[bindings["value"]].shape[-1] == 32
+        assert geometry["query_lens"] == (16,)
+        assert attention.attrs["sparse_mode"] == 3
+        (tmp_path / "attention-geometry.json").write_text(json.dumps(geometry, indent=2))
+
+
+def test_deepseek_v4_native_smla_captures_original_and_compressed_lengths():
+    workload = simulate(SimulationConfig(config="deepseek_v4_smoketest", seq_len=128))
+    for primitive in ("sparse_flash_mla", "sparse_flash_mla_grad"):
+        nodes = [
+            node
+            for template in workload.step_templates.values()
+            for node in template.nodes.values()
+            if node.annotations["raw_op_type"] == f"cann_ops_transformer.{primitive}.default"
+        ]
+        assert len(nodes) == 4
+        geometries = [dict(node.attrs["attention_geometry"]) for node in nodes]
+        assert all(facts["query_lens"] == facts["kv_lens"] == (128,) for facts in geometries)
+        assert sorted(facts["compressed_lens"] for facts in geometries if "compressed_lens" in facts) == [
+            (1,),
+            (32,),
+        ]

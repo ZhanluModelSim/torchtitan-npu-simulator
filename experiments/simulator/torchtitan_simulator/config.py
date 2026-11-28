@@ -56,6 +56,7 @@ class SimulationConfig:
     optimizer_name: Literal["AdamW", "Muon"] | None = None
     muon_ns_steps: int | None = None
     model_overrides: ModelOverrides | None = None
+    kimi_k31_short_sparse: bool = False
 
     def validate(self):
         if self.optimizer_name not in {None, "AdamW", "Muon"}:
@@ -67,6 +68,8 @@ class SimulationConfig:
         # an early reject here would also reject legal Muon configurations.
         if type(self.memory_offload_optimizer_states) is not bool:
             raise ValueError("memory_offload_optimizer_states must be boolean")
+        if type(self.kimi_k31_short_sparse) is not bool:
+            raise ValueError("kimi_k31_short_sparse must be boolean")
         if type(self.enable_sla2_fusion) is not bool:
             raise ValueError("enable_sla2_fusion must be boolean")
         preset, separator, precision = self.config.rpartition("_baseline_")
@@ -294,6 +297,8 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         if value is not None:
             setattr(trainer.training, target_name, value)
     model = trainer.model_spec.model
+    if simulation.kimi_k31_short_sparse and trainer.model_spec.name != "kimi_k3_1":
+        raise ValueError("kimi_k31_short_sparse is specific to Kimi K3.1")
     if trainer.model_spec.name == "kimi_k3_1" and simulation.enable_quantized_training:
         raise ValueError("Kimi K3.1 capture currently supports unquantized training only")
     if trainer.model_spec.name not in {

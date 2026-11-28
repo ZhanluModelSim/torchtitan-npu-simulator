@@ -27,24 +27,18 @@ python -m torchtitan_simulator --config kimi_k3_1_smoketest --training.seq-len 1
 
 ## DSA 执行与交付
 
-`kimi_k3/attention.py` 提供共享投影与 attention 扩展点；`kimi_k3_1/attention.py` 实现 DSA 差异，保留原有 Q/K/V、输出门控和投影。`dsa.py` 新增两步计算：
+K3.1 的模拟训练在长序列把 `W_UK` 吸收到 Q，在注意力后用 `W_UV` 恢复每头的 V 宽度，
+中间传一份共享 latent KV 和独立位置通道。Meta 抓图用 `npu_sparse_flash_attention` /
+`npu_sparse_flash_attention_grad` 表达前反向，保留实际 max、sum 和输出的保存关系；
+投影、归一化、输出门控和共享 KV 梯度加和位于融合边界外。学习型索引器仍使用
+`kimi_sim.dsa_indexer.default`，语言模型损失不会对硬 top-k 与索引器参数回传。
 
-1. 从归一化 Q latent 投影索引 Q，从 hidden 投影共享索引 K 与各头权重。打分为 `sum_head(ReLU(Q·K) * weight)`；FP32 累加并施加因果 mask，选出每行最多 top-k 个 key。可见 key 不足 top-k 的槽位为 `-1`。
-2. 按索引读取 K/V，只对这些位置计算 QK、FP32 softmax 与 AV。查询分块限制单次 gather 的大小，但 autograd 仍保存各块所需的 K/V，不能据此认为总训练保存量有界；原生 autograd 保留真实 K/V 保存值和散加梯度。不会先算完整 attention 再用 mask 假装稀疏。
-
-索引打分仍遍历候选 key，不能将整层 DSA 视为线性复杂度。序列长度不超过 top-k 时所有因果 key 都可见，直接复用 K3 的 dense attention 边界并跳过索引器计算。
-
-Meta runtime 自动安装 K3.1 的三个融合捕获边界：
-
-- `kimi_sim.dsa_indexer.default`：输入投影后的 Q、归一化 K 和已缩放的 FP32 weights，输出 int64 选取索引。索引器冻结，没有反向节点。
-- `kimi_sim.dsa_attention.default`：输入展开的 Q/K/V 和索引，输出 attention 结果和 FP32 logsumexp。Q/K 为 192 维、V 为 128 维时，输出仍为 128 维。
-- `kimi_sim.dsa_attention_grad.default`：读取前向实际保存的 Q/K/V、索引、输出、logsumexp 以及输出梯度，产生 Q/K/V 三项梯度。
-
-投影、LayerNorm、weights 缩放和输出门控继续保留在融合边界外。三个节点都有明确的 `tensor_semantics`；不向原始节点填入 FLOPs 或耗时。算子仓为这些训练入口解析逻辑语义，复用现有索引器和 FlashAttention 正反向公式；它们不是吸收投影后的推理 DSA 的原始名别名。
-
-融合不再暴露 eager 分块实现内部的 gather、score 和 softmax 临时张量；静态内存按该融合保存契约记录，而非声称保持 eager 临时显存不变。模型对索引打分采用全候选对代理，对 attention 使用有效因果 top-k 对数，并假设跳过早期 `-1` 槽位。这些是融合性能建模边界，不等于原 ATen 分块执行量或真实 NPU 内核测量。
-
-普通设备模型仍执行上述 PyTorch 稀疏参考实现。融合定义只用于显式 Meta 会话，在正常或异常退出时恢复方法；不会冒充原生 CANN kernel。KDA、SiTU 和短序列 dense attention 继续采用已有 Meta 兼容。
+`seq_len <= topk` 默认跳过索引器，使用稠密因果 `npu_fusion_attention_v3` 和对应反向。
+要显式比较短序列稀疏路径，可在模拟器 CLI 加 `--simulation.kimi-k31-short-sparse`，
+或在 sim-platform TOML 的 `[training]` 中写 `kimi_k31_short_sparse = true`。
+该选项构造全覆盖因果索引，用 `-1` 填充到原生 ABI 的索引宽度。
+Scale 从原始 QK head dim 算，Cube/Vec 的有效配对仍按因果三角累计，物理索引读按填充形状计。
+Meta 兼容也支持 debug 小模型形状，其定位是抓图和公式回归。
 
 ## 训练、状态与验证边界
 
@@ -58,4 +52,4 @@ Meta runtime 自动安装 K3.1 的三个融合捕获边界：
 
 CPU 数学、梯度与状态映射验证见 [test_kimi_dsa.py](../../../tests/unit_tests/models/kimi_k3_1/test_kimi_dsa.py)；真实入口的 Meta 捕获、重计算、冻结内存和并行验证见 [test_kimi_k3_1_capture.py](../tests/test_kimi_k3_1_capture.py)。这两类验证均不证明真实 NPU 训练数值或性能。
 
-融合捕获验证使用 wheel 普通安装，覆盖小模型单卡、FSDP、TP、CP、EP 及 none/full/selective AC，并回归原 K3 捕获和 CPU 稀疏数学测试。完整 `kimi_k3_1_full` 另以 S=4224、64 逻辑卡、TP=CP=PP=1、DP replicate=4、DP shard=16、EP=16、selective AC 且保存 gmm 验证：三个模板共 99,111 个节点，索引器 48 个、稀疏 attention 前向 48 个、反向 24 个；2642 个参数有梯度，indexer 无梯度。全部 120 个 DSA 节点经平台适配后命中索引器／FlashAttention 正反向模型并返回正耗时。用于联通验证的硬件为 synthetic；本验证不证明真实 NPU 数值、内部 workspace 或耗时精度。
+早期虚拟 DSA 路径以 wheel 普通安装验证了小模型单卡、FSDP、TP、CP、EP 及 none/full/selective AC，并回归原 K3 捕获和 CPU 稀疏数学测试。该路径的完整 `kimi_k3_1_full` 另以 S=4224、64 逻辑卡、TP=CP=PP=1、DP replicate=4、DP shard=16、EP=16、selective AC 且保存 gmm 验证：三个模板共 99,111 个节点，索引器 48 个、稀疏 attention 前向 48 个、反向 24 个；2642 个参数有梯度，indexer 无梯度。全部 120 个 DSA 节点经平台适配后命中索引器／FlashAttention 正反向模型并返回正耗时。用于联通验证的硬件为 synthetic；本验证不证明真实 NPU 数值、内部 workspace 或耗时精度。

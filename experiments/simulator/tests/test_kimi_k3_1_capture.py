@@ -11,6 +11,35 @@ from torchtitan_simulator.runner import simulate
 from torchtitan_simulator.validation import validate_workload
 
 
+@pytest.mark.parametrize("short_sparse", (False, True), ids=("dense-default", "sparse-opt-in"))
+def test_k3_1_short_capture_uses_causal_native_forward_and_backward(short_sparse):
+    workload = simulate(
+        SimulationConfig(
+            config="kimi_k3_1_smoketest",
+            seq_len=8,
+            kimi_k31_short_sparse=short_sparse,
+        )
+    )
+    by_name = {
+        node.annotations["raw_op_type"]: node
+        for template in workload.step_templates.values()
+        for node in template.nodes.values()
+    }
+    assert "kimi_sim.dsa_indexer.default" not in by_name
+    dense = "npu.npu_fusion_attention_v3.default"
+    sparse = "npu.npu_sparse_flash_attention.default"
+    assert (dense in by_name, sparse in by_name) == (not short_sparse, short_sparse)
+    if short_sparse:
+        facts = dict(by_name[sparse].attrs["attention_geometry"])
+        assert facts["pair_count_source"] == "deterministic_causal_all_keys"
+        assert facts["dense_qk_pairs"] == 64
+        assert facts["effective_qk_pairs"] == 36
+        assert dict(by_name["npu.npu_sparse_flash_attention_grad.default"].attrs["attention_geometry"]) == facts
+    else:
+        assert dict(by_name[dense].attrs["attention_geometry"])["query_lens"] == (8,)
+        assert "npu.npu_fusion_attention_grad_v3.default" in by_name
+
+
 @pytest.mark.parametrize(
     "world,rank,tp,cp,ep,ac",
     [
@@ -43,24 +72,24 @@ def test_k3_1_sparse_capture_retains_selection_gradients_and_frozen_memory(world
     annotations = workload.iteration.schedule.annotations
     nodes = [node for template in workload.step_templates.values() for node in template.nodes.values()]
     names = [node.annotations["raw_op_type"] for node in nodes]
-    for raw in (
-        "kimi_sim.dsa_indexer.default",
-        "kimi_sim.dsa_attention.default",
-        "kimi_sim.dsa_attention_grad.default",
-    ):
-        assert raw in names
-    # Selection and selected-key attention are fused in Meta; unrelated top-k
-    # or indexing elsewhere in the model is not excluded by name.
-    dsa_nodes = [node for node in nodes if node.annotations["raw_op_type"].startswith("kimi_sim.dsa_")]
-    assert all("tensor_semantics" in node.attrs for node in dsa_nodes)
-    fwd = next(node for node in dsa_nodes if node.annotations["raw_op_type"] == "kimi_sim.dsa_attention.default")
-    bwd = next(node for node in dsa_nodes if node.annotations["raw_op_type"] == "kimi_sim.dsa_attention_grad.default")
-    assert fwd.inputs[0].shape[-1] == 32 and fwd.outputs[0].shape[-1] == 16
+    selected = "npu.npu_sparse_flash_attention.default"
+    selected_grad = "npu.npu_sparse_flash_attention_grad.default"
+    assert "kimi_sim.dsa_indexer.default" in names
+    assert "kimi_sim.dsa_attention.default" not in names
+    assert "npu.npu_fusion_attention_v3.default" not in names
+    fwd = next(node for node in nodes if node.annotations["raw_op_type"] == selected)
+    bwd = next(node for node in nodes if node.annotations["raw_op_type"] == selected_grad)
+    facts = dict(fwd.attrs["attention_geometry"])
+    assert facts["effective_qk_pairs"] == 100
+    assert facts["dense_qk_pairs"] == 256
+    assert facts["shared_key_value"] is True
+    assert dict(bwd.attrs["attention_geometry"]) == facts
+    bindings = dict(fwd.attrs["input_tensor_bindings"])
+    assert fwd.inputs[bindings["key"]].shape == fwd.inputs[bindings["value"]].shape
+    assert fwd.inputs[bindings["sparse_indices"]].shape[-1] == 1024
+    assert fwd.inputs[bindings["query_rope"]].shape[-1] == 16
     assert fwd.outputs[1].dtype == "float32"
-    assert [t.shape for t in bwd.outputs] == [t.shape for t in bwd.inputs[:3]]
-    # Every MLA row uses the selected-key path; dense legacy fusion must not
-    # silently replace the sparse computation or its autograd saves.
-    assert "kimi_sim.fusion_attention.default" not in names
+    assert len(bwd.outputs) == 5
     gradients = annotations["gradient_validation"]
     assert "layers.3.attention.q_b_proj.weight" in gradients
     assert "layers.3.attention.kv_b_proj.weight" in gradients
