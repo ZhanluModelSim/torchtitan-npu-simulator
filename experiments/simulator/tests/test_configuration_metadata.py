@@ -62,8 +62,10 @@ def test_draft_rejects_changed_dp_and_probes_repair_without_mutating_request():
     assert "global_batch_size=2" in query["validation"]["reason"]
     current, repaired, wrong_type = query["field"]["choices"]
     assert not current["available"] and current["reason"] == query["validation"]["reason"]
+    assert current["failed_check"] == "batch_divisibility" and current["failed_path"] is None
     assert repaired["available"] and repaired["reason"] is None
     assert not wrong_type["available"] and "integer" in wrong_type["reason"]
+    assert wrong_type["failed_check"] == "candidate_type" and wrong_type["failed_path"] == ["tensor_parallel_degree"]
     assert draft.tensor_parallel_degree == 1
 
 
@@ -120,3 +122,32 @@ def test_capture_dtype_field_distinguishes_build_only_from_capture_preparation()
     assert not choices["bfloat16"]["available"]
     assert choices["bfloat16"]["reason"] == field["validation"]["reason"]
     assert choices["float32"]["available"]
+
+
+def test_tp_candidates_report_dtype_failure_from_unchanged_part_of_draft():
+    from torchtitan_simulator.config import SimulationConfig
+    from torchtitan_simulator.configuration_metadata import describe_configuration_field
+
+    draft = SimulationConfig(world_size=2, training_dtype="bfloat16")
+    report = describe_configuration_field(draft, ["tensor_parallel_degree"], candidates=[1, 2])
+    assert report["validation"]["failed_check"] == "capture_dtype"
+    assert report["validation"]["failed_path"] == ["training_dtype"]
+    for choice in report["field"]["choices"]:
+        assert not choice["available"] and choice["failed_check"] == "capture_dtype"
+        assert choice["failed_path"] == ["training_dtype"]
+        assert "DeepSeek V4 capture requires" in choice["reason"]
+
+
+def test_untagged_native_failure_does_not_blame_probed_field(monkeypatch):
+    from torchtitan_simulator import configuration_metadata
+    from torchtitan_simulator.config import SimulationConfig
+
+    def reject(_):
+        raise ValueError("factory constraint")
+
+    monkeypatch.setattr(configuration_metadata, "prepare_capture_config", reject)
+    report = configuration_metadata.describe_configuration_field(SimulationConfig(), ["seq_len"], candidates=[64])
+    (choice,) = report["field"]["choices"]
+    assert not choice["available"]
+    assert choice["failed_check"] == "native_configuration" and choice["failed_path"] is None
+    assert choice["reason"] == "factory constraint"

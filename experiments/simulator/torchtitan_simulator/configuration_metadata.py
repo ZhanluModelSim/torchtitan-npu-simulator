@@ -16,6 +16,7 @@ from torchtitan_simulator.config import (
     PRECISION_CHOICES,
     PRESET_FACTORIES,
     TARGET_NPU_DEVICE_TYPES,
+    ConfigurationCheckError,
     SimulationConfig,
     prepare_capture_config,
 )
@@ -161,16 +162,28 @@ def _describe_presets(presets: Sequence[str]) -> dict:
     }
 
 
+def _rejection(check: str, reason: str, path: Sequence[str] | None = None) -> dict[str, object]:
+    return {"valid": False, "reason": reason, "failed_check": check, "failed_path": list(path) if path else None}
+
+
 def _check_draft(simulation: SimulationConfig) -> tuple[dict, dict[str, int] | None]:
     # Catalog discovery may only import producer-owned factories and their declared overrides.
     if simulation.config not in PRESET_FACTORIES:
-        return {"valid": False, "reason": "Training field discovery requires a registered preset"}, None
+        return _rejection(
+            "registered_preset", "Training field discovery requires a registered preset", ["config"]
+        ), None
     if simulation.override_imports:
-        return {"valid": False, "reason": "Training field discovery does not import explicit override modules"}, None
+        return _rejection(
+            "override_imports",
+            "Training field discovery does not import explicit override modules",
+            ["override_imports"],
+        ), None
     try:
         prepared = prepare_capture_config(simulation)
+    except ConfigurationCheckError as exc:
+        return _rejection(exc.check, str(exc), [exc.field_name] if exc.field_name else None), None
     except (ValueError, TypeError, AssertionError, NotImplementedError) as exc:
-        return {"valid": False, "reason": str(exc) or type(exc).__name__}, None
+        return _rejection("native_configuration", str(exc) or type(exc).__name__), None
     return {"valid": True, "reason": None}, prepared.batch_configuration
 
 
@@ -231,10 +244,12 @@ def describe_configuration_field(
                 or (kind == "string" and not isinstance(value, str))
                 or (kind == "float" and (isinstance(value, bool) or not isinstance(value, (float, int))))
             ):
-                status = {"valid": False, "reason": f"{'.'.join(path)} expects {kind}"}
+                status = _rejection("candidate_type", f"{'.'.join(path)} expects {kind}", path)
             else:
                 status, _ = _check_draft(_draft_value(simulation, path, value))
-        choices.append({"value": value, "label": str(value), "available": status["valid"], "reason": status["reason"]})
+        choice = {"value": value, "label": str(value), **status}
+        choice["available"] = choice.pop("valid")
+        choices.append(choice)
     return {
         "field": {**declared, "choices": choices, "choice_scope": "current_request_preflight", "requested": current},
         "validation": validation,

@@ -10,8 +10,10 @@ from importlib import import_module
 
 
 def validate_target_selection(target: str) -> None:
-    if target != "non_a5":
+    if target == "a5":
         raise ValueError("A5 backend acceptance is pending; this runtime currently verifies non_a5")
+    if target != "non_a5":
+        raise ValueError("target_npu_device_type must be 'non_a5' or 'a5'")
 
 
 def install_target_selection(scope, target):

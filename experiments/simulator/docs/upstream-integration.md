@@ -112,6 +112,8 @@ F 内可能交错 lm_head/loss backward，不能只按 `phase` 切 F/B。原始 
 
 `describe_configuration_field(simulation, path, candidates=...)` 面向已登记的 preset，路径相对训练配置。它保留草稿其他字段，用 `prepare_capture_config` 分别预检当前组合与每个候选。闭合枚举默认列出声明的值；DP 和 batch 等整数范围可通过 `candidates` 指定要比较的点。候选的 `available` 和 `reason` 描述这次配置预检，模型构建、图形状和算子执行仍要现场验证。查询可加载内置 recipe 及其原生 override，禁止通过草稿导入自定义 factory 和非空的显式 override 模块列表。
 
+被拒绝的草稿和候选均保留原生错误详情 `reason`，并通过 `failed_check` 标识失败检查。能定位到单个字段时，`failed_path` 给出相对训练配置的路径段。例如在 DeepSeek V4 的 BF16 基础参数草稿上查询 TP，候选会报告 `capture_dtype` 和 `["training_dtype"]`。GBS、微批与 DP 共同造成整除冲突时，检查为 `batch_divisibility`，路径为 `null`。无结构化来源的原生错误返回 `native_configuration` 和 `null`。
+
 ```python
 from torchtitan_simulator.config import SimulationConfig
 from torchtitan_simulator.configuration_metadata import describe_configuration_field

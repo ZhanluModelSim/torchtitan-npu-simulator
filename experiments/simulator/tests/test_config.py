@@ -63,6 +63,18 @@ def test_unverified_target_is_explicitly_rejected_by_cli():
         main(["--build-only", "--simulation.target-npu-device-type", "a5"])
 
 
+@pytest.mark.parametrize(
+    ("target", "message"),
+    [("a5", "A5 backend acceptance is pending"), ("unknown", "target_npu_device_type must be")],
+)
+def test_invalid_capture_target_is_rejected_before_native_preparation(monkeypatch, target, message):
+    from torchtitan_simulator import config
+
+    monkeypatch.setattr(config, "prepare_config", lambda _: pytest.fail("native config was prepared"))
+    with pytest.raises(ValueError, match=message):
+        config.prepare_capture_config(SimulationConfig(target_npu_device_type=target))
+
+
 def test_logical_device_selection_does_not_inherit_host_a5_flags(monkeypatch):
     from importlib import import_module
 
