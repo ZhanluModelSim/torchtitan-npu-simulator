@@ -94,7 +94,7 @@ def _register_fusion_semantics(
     )
 
 
-@torch.library.custom_op("fused::sla2_sparse_attention", mutates_args=())
+@torch.library.custom_op("multi_head_moe_sim::sla2_sparse_attention", mutates_args=())
 def sla2_sparse_attention(
     q_BHTD: torch.Tensor,
     k_BHTD: torch.Tensor,
@@ -116,7 +116,7 @@ def _sla2_sparse_meta(q_BHTD, k_BHTD, v_BHTD, block_mask_BHqq, selected_blocks):
     return torch.empty_like(q_BHTD)
 
 
-@torch.library.custom_op("fused::sla2_sparse_attention_grad", mutates_args=())
+@torch.library.custom_op("multi_head_moe_sim::sla2_sparse_attention_grad", mutates_args=())
 def sla2_sparse_attention_grad(
     q_BHTD: torch.Tensor,
     k_BHTD: torch.Tensor,
@@ -160,7 +160,7 @@ def _sparse_backward(ctx, dy):
 sla2_sparse_attention.register_autograd(_sparse_backward, setup_context=_sparse_setup)
 
 
-@torch.library.custom_op("fused::sla2_linear_attention", mutates_args=())
+@torch.library.custom_op("multi_head_moe_sim::sla2_linear_attention", mutates_args=())
 def sla2_linear_attention(
     q_BHTD: torch.Tensor,
     k_BHTD: torch.Tensor,
@@ -182,7 +182,7 @@ def _sla2_linear_meta(q_BHTD, k_BHTD, v_BHTD, complement_mask_BHqq, selected_blo
     return torch.empty_like(q_BHTD)
 
 
-@torch.library.custom_op("fused::sla2_linear_attention_grad", mutates_args=())
+@torch.library.custom_op("multi_head_moe_sim::sla2_linear_attention_grad", mutates_args=())
 def sla2_linear_attention_grad(
     q_BHTD: torch.Tensor,
     k_BHTD: torch.Tensor,
@@ -254,7 +254,7 @@ _SWIGLU_INPUTS = (
 _SWIGLU_OUTPUT = TensorMeaning("activated_output", _SWIGLU_AXES, unknown_leading_axes=True)
 
 
-@torch.library.custom_op("fused::swiglu", mutates_args=())
+@torch.library.custom_op("multi_head_moe_sim::swiglu", mutates_args=())
 def moe_sim_swiglu(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     """Virtual boundary of the fused silu-gated activation kernel.
 
@@ -270,7 +270,7 @@ def _moe_sim_swiglu_meta(x, gate):
     return torch.empty_like(x)
 
 
-@torch.library.custom_op("fused::swiglu_backward", mutates_args=())
+@torch.library.custom_op("multi_head_moe_sim::swiglu_backward", mutates_args=())
 def moe_sim_swiglu_backward(x: torch.Tensor, gate: torch.Tensor, dy: torch.Tensor) -> list[torch.Tensor]:
     """Virtual backward of the fused silu-gated activation kernel."""
     raise RuntimeError("multi_head_moe virtual swiglu backward is available only for Meta simulation")
@@ -295,7 +295,7 @@ moe_sim_swiglu.register_autograd(_moe_sim_swiglu_backward, setup_context=_moe_si
 _register_fusion_semantics(moe_sim_swiglu, moe_sim_swiglu_backward, _SWIGLU_INPUTS, _SWIGLU_OUTPUT, "dy", ("x", "gate"))
 
 
-@torch.library.custom_op("fused::router_soft_topk", mutates_args=())
+@torch.library.custom_op("multi_head_moe_sim::router_soft_topk", mutates_args=())
 def router_soft_topk(score_BHqq: torch.Tensor, temp: float, topk_blocks: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Virtual boundary of the fused gumbel soft top-k block-mask kernel.
 
@@ -315,7 +315,7 @@ def _router_soft_topk_meta(score_BHqq, temp, topk_blocks):
     return torch.empty_like(score_BHqq), torch.empty_like(score_BHqq)
 
 
-@torch.library.custom_op("fused::router_soft_topk_backward", mutates_args=())
+@torch.library.custom_op("multi_head_moe_sim::router_soft_topk_backward", mutates_args=())
 def router_soft_topk_backward(
     mask_BHqq: torch.Tensor,
     s_BHqq: torch.Tensor,

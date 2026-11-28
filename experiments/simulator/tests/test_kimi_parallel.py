@@ -132,8 +132,8 @@ def test_kimi_parallel_capture_matches_independent_shards_and_reduces_before_lat
     )
     assert len(annotations["gradient_validation"]) == 110
     events = memory.raw_events
-    kda = next(event for event in events if event.raw_op_type == "fused.chunk_kda.default")
-    mla = next(event for event in events if event.raw_op_type == "fused.fusion_attention.default")
+    kda = next(event for event in events if event.raw_op_type == "kimi_sim.chunk_kda.default")
+    mla = next(event for event in events if event.raw_op_type == "kimi_sim.fusion_attention.default")
     assert kda.inputs[0].shape == (1, 16, 8 // tp, 32)
     compute_dtype = annotations["precision_configuration"]["mixed_precision_param"]
     assert [ref.dtype for ref in kda.inputs[-2:]] == [compute_dtype, compute_dtype]

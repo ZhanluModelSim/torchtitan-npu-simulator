@@ -288,25 +288,25 @@ def _sla2_families() -> dict:
     return {
         "sla2_sparse_attention": (
             "Sla2SparseAttention",
-            "fused.sla2_sparse_attention.default",
+            "multi_head_moe_sim.sla2_sparse_attention.default",
             Sla2SparseAttentionAdaptor(),
             Sla2SparseAttentionRoofline,
         ),
         "sla2_sparse_attention_gradient": (
             "Sla2SparseAttentionGradient",
-            "fused.sla2_sparse_attention_grad.default",
+            "multi_head_moe_sim.sla2_sparse_attention_grad.default",
             Sla2SparseAttentionGradientAdaptor(),
             Sla2SparseAttentionGradientRoofline,
         ),
         "sla2_linear_attention": (
             "Sla2LinearAttention",
-            "fused.sla2_linear_attention.default",
+            "multi_head_moe_sim.sla2_linear_attention.default",
             Sla2LinearAttentionAdaptor(),
             Sla2LinearAttentionRoofline,
         ),
         "sla2_linear_attention_gradient": (
             "Sla2LinearAttentionGradient",
-            "fused.sla2_linear_attention_grad.default",
+            "multi_head_moe_sim.sla2_linear_attention_grad.default",
             Sla2LinearAttentionGradientAdaptor(),
             Sla2LinearAttentionGradientRoofline,
         ),
@@ -374,7 +374,7 @@ def _sla2_sparse_attention_cost(
     hardware=None,
     attrs: dict | None = None,
 ) -> CostEstimate:
-    """``fused.sla2_sparse_attention`` (+ grad) via the library model."""
+    """``multi_head_moe_sla2_sparse_attention`` (+ grad) via the library model."""
     return _sla2_library_cost(
         "sla2_sparse_attention" if len(outputs) == 1 else "sla2_sparse_attention_gradient",
         inputs,
@@ -390,7 +390,7 @@ def _sla2_linear_attention_cost(
     hardware=None,
     attrs: dict | None = None,
 ) -> CostEstimate:
-    """``fused.sla2_linear_attention`` (+ grad) via the library model."""
+    """``multi_head_moe_sla2_linear_attention`` (+ grad) via the library model."""
     return _sla2_library_cost(
         "sla2_linear_attention" if len(outputs) == 1 else "sla2_linear_attention_gradient",
         inputs,

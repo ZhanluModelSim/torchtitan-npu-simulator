@@ -21,7 +21,7 @@ The host sparse-gradient side effects are bridged explicitly for Meta
 (PR #19 review protocol): the pending sparse gradient accumulates on meta
 tensors, the host clipping rescale keeps its op structure, and the
 per-table SparseAdam update records through the declared
-``fused.sparse_adam_update`` boundary so the captured F/B/O includes
+``system3_sim.sparse_adam_update`` boundary so the captured F/B/O includes
 the sparse work the dense gradient contract exempts. Real-device execution
 is untouched.
 """
@@ -43,7 +43,7 @@ from torchtitan_simulator.capture.tensor_semantics import (
 )
 
 
-@torch.library.custom_op("fused::sparse_adam_update", mutates_args=("parameter", "exp_avg", "exp_avg_sq"))
+@torch.library.custom_op("system3_sim::sparse_adam_update", mutates_args=("parameter", "exp_avg", "exp_avg_sq"))
 def sparse_adam_update(
     parameter: torch.Tensor,
     grad_indices: torch.Tensor,
@@ -73,7 +73,7 @@ def _sparse_adam_update_meta(parameter, grad_indices, grad_values, exp_avg, exp_
 
 
 register_tensor_semantics(
-    "fused.sparse_adam_update.default",
+    "system3_sim.sparse_adam_update.default",
     OperatorTensorSemantics(
         inputs=(
             ("parameter", TensorMeaning("host_table_weight", ("table_row", "embedding_dim"))),

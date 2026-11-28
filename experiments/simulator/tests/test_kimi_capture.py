@@ -53,7 +53,7 @@ def test_kimi_capture_retains_fused_backward_gradients_and_independent_parameter
         "situ_glu",
         "situ_glu_backward",
     ):
-        assert counts[f"fused.{op}.default"] > 0, op
+        assert counts[f"kimi_sim.{op}.default"] > 0, op
     gradients = annotations["gradient_validation"]
     assert len(gradients) == 110
     for key in (
@@ -112,7 +112,7 @@ def test_virtual_fusion_saves_actual_inputs_and_preserves_backward_identity_and_
         assert leaf.grad.dtype == value.dtype
         assert any(slot.tensor_id == capture.tensor_id(value) for slot in capture.autograd_saved_tensor_events())
     forward_name = str(op._opoverload)
-    backward_raw = f"fused.{backward_name}.default"
+    backward_raw = f"kimi_sim.{backward_name}.default"
     memory = capture.memory_events()
     forward = next(event for event in memory if event.raw_op_type == forward_name)
     backward = next(event for event in memory if event.raw_op_type == backward_raw)
@@ -173,7 +173,7 @@ def test_kimi_normal_fsdp_precision_reaches_kda_and_fp32_gradient_reduction(para
     )
     annotations = workload.iteration.schedule.annotations
     events = annotations["memory_plan"].raw_events
-    kda = next(event for event in events if event.raw_op_type == "fused.chunk_kda.default")
+    kda = next(event for event in events if event.raw_op_type == "kimi_sim.chunk_kda.default")
     assert [ref.dtype for ref in kda.inputs[-2:]] == [param_dtype, param_dtype]
     assert {entry["dtype"] for entry in annotations["gradient_validation"].values()} == {"torch.float32"}
     reductions = [event for event in events if "reduce_scatter" in event.raw_op_type]

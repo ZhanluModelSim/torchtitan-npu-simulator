@@ -128,7 +128,7 @@ def _register_fusion_semantics(
     )
 
 
-@torch.library.custom_op("fused::gated_delta_rule", mutates_args=())
+@torch.library.custom_op("qwen3_5_sim::gated_delta_rule", mutates_args=())
 def gated_delta_rule(
     xq_BLNK: torch.Tensor,
     xk_BLNK: torch.Tensor,
@@ -146,7 +146,7 @@ def _gdn_meta(xq_BLNK, xk_BLNK, xv_BLNV, g_BLN, beta_BLN, reset):
     return torch.empty_like(xv_BLNV)
 
 
-@torch.library.custom_op("fused::gated_delta_rule_grad", mutates_args=())
+@torch.library.custom_op("qwen3_5_sim::gated_delta_rule_grad", mutates_args=())
 def gated_delta_rule_grad(
     xq_BLNK: torch.Tensor,
     xk_BLNK: torch.Tensor,
@@ -180,7 +180,7 @@ def _gdn_backward(ctx, dy):
 gated_delta_rule.register_autograd(_gdn_backward, setup_context=_gdn_setup)
 
 
-@torch.library.custom_op("fused::flex_attention", mutates_args=())
+@torch.library.custom_op("qwen3_5_sim::flex_attention", mutates_args=())
 def flex_attention(
     q_BNLH: torch.Tensor,
     k_BNLH: torch.Tensor,
@@ -224,7 +224,7 @@ def _flex_meta(
     return torch.empty_like(q_BNLH)
 
 
-@torch.library.custom_op("fused::flex_attention_grad", mutates_args=())
+@torch.library.custom_op("qwen3_5_sim::flex_attention_grad", mutates_args=())
 def flex_attention_grad(
     q_BNLH: torch.Tensor,
     k_BNLH: torch.Tensor,

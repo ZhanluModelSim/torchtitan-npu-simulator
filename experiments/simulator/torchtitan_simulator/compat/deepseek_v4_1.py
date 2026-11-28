@@ -34,7 +34,7 @@ from torchtitan_simulator.capture.tensor_semantics import (
 )
 
 
-@torch.library.custom_op("fused::sparse_adam_update", mutates_args=("parameter", "exp_avg", "exp_avg_sq"))
+@torch.library.custom_op("dsv41_sim::sparse_adam_update", mutates_args=("parameter", "exp_avg", "exp_avg_sq"))
 def sparse_adam_update(
     parameter: torch.Tensor,
     grad_indices: torch.Tensor,
@@ -64,7 +64,7 @@ def _sparse_adam_update_meta(parameter, grad_indices, grad_values, exp_avg, exp_
 
 
 register_tensor_semantics(
-    "fused.sparse_adam_update.default",
+    "dsv41_sim.sparse_adam_update.default",
     OperatorTensorSemantics(
         inputs=(
             ("parameter", TensorMeaning("host_table_weight", ("table_row", "embedding_dim"))),

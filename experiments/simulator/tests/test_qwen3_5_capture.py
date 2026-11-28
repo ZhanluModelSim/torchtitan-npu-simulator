@@ -81,10 +81,10 @@ def test_qwen3_5_capture_reaches_iteration_with_virtual_gdn_and_flex_boundaries(
     nodes = [n for template in workload.step_templates.values() for n in template.nodes.values()]
     counts = Counter(n.annotations["raw_op_type"] for n in nodes)
     for op in (
-        "fused.gated_delta_rule.default",
-        "fused.gated_delta_rule_grad.default",
-        "fused.flex_attention.default",
-        "fused.flex_attention_grad.default",
+        "qwen3_5_sim.gated_delta_rule.default",
+        "qwen3_5_sim.gated_delta_rule_grad.default",
+        "qwen3_5_sim.flex_attention.default",
+        "qwen3_5_sim.flex_attention_grad.default",
     ):
         assert counts[op] > 0, op
     gradients = workload.iteration.schedule.annotations["gradient_validation"]
@@ -98,10 +98,10 @@ def test_qwen3_5_capture_reaches_iteration_with_virtual_gdn_and_flex_boundaries(
     assert memory.optimizer_state_bytes == local_params * 8 + _TOTAL_PARAM_TENSORS * 4
     custom = [n for n in nodes if "tensor_semantics" in n.attrs]
     assert {n.annotations["raw_op_type"] for n in custom} == {
-        "fused.gated_delta_rule.default",
-        "fused.gated_delta_rule_grad.default",
-        "fused.flex_attention.default",
-        "fused.flex_attention_grad.default",
+        "qwen3_5_sim.gated_delta_rule.default",
+        "qwen3_5_sim.gated_delta_rule_grad.default",
+        "qwen3_5_sim.flex_attention.default",
+        "qwen3_5_sim.flex_attention_grad.default",
     }
     assert all(
         "tensor_semantics" not in n.attrs
@@ -122,7 +122,7 @@ def test_qwen3_5_capture_reaches_iteration_with_virtual_gdn_and_flex_boundaries(
     gdn_forward = next(
         n
         for n in custom
-        if n.annotations["raw_op_type"] == "fused.gated_delta_rule.default"
+        if n.annotations["raw_op_type"] == "qwen3_5_sim.gated_delta_rule.default"
     )
     roles = [item["role"] for item in gdn_forward.attrs["tensor_semantics"]["inputs"]]
     # The fixed-length path still materializes a per-document reset mask from
@@ -130,7 +130,7 @@ def test_qwen3_5_capture_reaches_iteration_with_virtual_gdn_and_flex_boundaries(
     assert roles == ["query", "key", "value", "decay_gate", "update_gate", "state_reset_mask"]
     assert tuple(gdn_forward.inputs[5].shape) == (1, 16)
     flex_forwards = [
-        n for n in custom if n.annotations["raw_op_type"] == "fused.flex_attention.default"
+        n for n in custom if n.annotations["raw_op_type"] == "qwen3_5_sim.flex_attention.default"
     ]
     assert flex_forwards
     for node in flex_forwards:
@@ -189,7 +189,7 @@ def test_qwen3_5_virtual_fusion_saves_actual_inputs_and_preserves_backward_ident
         assert leaf.grad is not None and leaf.grad.shape == value.shape
         assert leaf.grad.dtype == value.dtype
     forward_name = str(op._opoverload)
-    backward_raw = f"fused.{backward_name}.default"
+    backward_raw = f"qwen3_5_sim.{backward_name}.default"
     memory = capture.memory_events()
     forward = next(event for event in memory if event.raw_op_type == forward_name)
     backward = next(event for event in memory if event.raw_op_type == backward_raw)
@@ -224,8 +224,8 @@ def test_qwen3_5_fusion_semantics_declare_roles_and_skip_absent_reset():
         flex_out.backward(torch.empty_like(flex_out))
 
     nodes = {node.annotations["raw_op_type"]: node for node in capture.build_nodes().values()}
-    gdn = nodes["fused.gated_delta_rule.default"]
-    gdn_backward = nodes["fused.gated_delta_rule_grad.default"]
+    gdn = nodes["qwen3_5_sim.gated_delta_rule.default"]
+    gdn_backward = nodes["qwen3_5_sim.gated_delta_rule_grad.default"]
     expected_gdn_inputs = (
         {"index": 0, "role": "query", "axes": ("batch", "sequence", "head", "key_head_dim")},
         {"index": 1, "role": "key", "axes": ("batch", "sequence", "head", "key_head_dim")},
@@ -249,8 +249,8 @@ def test_qwen3_5_fusion_semantics_declare_roles_and_skip_absent_reset():
         "decay_gate_gradient",
         "update_gate_gradient",
     ]
-    flex = nodes["fused.flex_attention.default"]
-    flex_backward = nodes["fused.flex_attention_grad.default"]
+    flex = nodes["qwen3_5_sim.flex_attention.default"]
+    flex_backward = nodes["qwen3_5_sim.flex_attention_grad.default"]
     expected_flex_inputs = (
         {"index": 0, "role": "query", "axes": ("batch", "head", "q_len", "head_dim")},
         {"index": 1, "role": "key", "axes": ("batch", "head", "kv_len", "head_dim")},
@@ -301,7 +301,7 @@ def test_qwen3_5_flex_fusion_keeps_blockmask_payload_connected():
         )
         out.backward(torch.empty_like(out))
     nodes = {node.annotations["raw_op_type"]: node for node in capture.build_nodes().values()}
-    forward = nodes["fused.flex_attention.default"]
+    forward = nodes["qwen3_5_sim.flex_attention.default"]
     roles = {item["role"]: item["index"] for item in forward.attrs["tensor_semantics"]["inputs"]}
     # The block-structure tensors are real dependency inputs of the captured
     # forward and backward nodes, with declared mask semantics (PR #19
@@ -319,8 +319,8 @@ def test_qwen3_5_flex_fusion_keeps_blockmask_payload_connected():
     assert tuple(forward.inputs[roles["key_block_count_mask"]].shape) == (1, 1, 1)
     assert tuple(forward.inputs[roles["key_block_index_mask"]].shape) == (1, 1, 1, 4)
     memory = capture.memory_events()
-    forward_event = next(e for e in memory if e.raw_op_type == "fused.flex_attention.default")
-    backward_event = next(e for e in memory if e.raw_op_type == "fused.flex_attention_grad.default")
+    forward_event = next(e for e in memory if e.raw_op_type == "qwen3_5_sim.flex_attention.default")
+    backward_event = next(e for e in memory if e.raw_op_type == "qwen3_5_sim.flex_attention_grad.default")
     mask_ids = {
         capture.tensor_id(tensor)
         for tensor in (kv_num_blocks, kv_indices, q_num_blocks, q_indices, full_kv_num_blocks, full_kv_indices)

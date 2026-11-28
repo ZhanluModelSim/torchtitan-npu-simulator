@@ -17,10 +17,14 @@ from torchtitan_simulator.validation import validate_workload
 # n_heads=4, head_dim=64, block=64, router proj 64, inter_dim=512,
 # MoE heads S=4, head hidden hs=64, Es=16, Ks=4, expert mult 2 (inter=128),
 # shared inter 128, FP32 parameters.
-_SPARSE_FWD = "fused.sla2_sparse_attention.default"
-_SPARSE_BWD = "fused.sla2_sparse_attention_grad.default"
-_LINEAR_FWD = "fused.sla2_linear_attention.default"
-_LINEAR_BWD = "fused.sla2_linear_attention_grad.default"
+_SPARSE_FWD = "multi_head_moe_sim.sla2_sparse_attention.default"
+_SPARSE_BWD = "multi_head_moe_sim.sla2_sparse_attention_grad.default"
+_LINEAR_FWD = "multi_head_moe_sim.sla2_linear_attention.default"
+_LINEAR_BWD = "multi_head_moe_sim.sla2_linear_attention_grad.default"
+_ROUTER_FWD = "multi_head_moe_sim.router_soft_topk.default"
+_ROUTER_BWD = "multi_head_moe_sim.router_soft_topk_backward.default"
+_SWIGLU_FWD = "multi_head_moe_sim.swiglu.default"
+_SWIGLU_BWD = "multi_head_moe_sim.swiglu_backward.default"
 
 _D, _V, _HID = 256, 102400, 512
 _H, _HD, _PROJ = 4, 64, 64
@@ -96,7 +100,7 @@ def test_multi_head_moe_capture_reaches_iteration_with_sla2_eager_operators(worl
     assert counts["aten.masked_fill.Scalar"] == 8 * recompute + 8
     assert counts["aten.view_as_complex.default"] == 16 * recompute + 16
     assert counts["aten.topk.default"] == 8 * (2 if ac == "full" else 1)
-    assert not any(raw.startswith("fused.") for raw in counts)
+    assert not any(raw.startswith("multi_head_moe_sim.") for raw in counts)
     gradients = workload.iteration.schedule.annotations["gradient_validation"]
     assert len(gradients) == _TOTAL_PARAM_TENSORS
     degree = world // replicate
@@ -468,23 +472,37 @@ def test_multi_head_moe_opt_in_fusion_replaces_only_the_two_branch_seams():
     assert result["graph_acyclic"] and result["peak_storage_unique"]
     nodes = [n for template in workload.step_templates.values() for n in template.nodes.values()]
     counts = Counter(n.annotations["raw_op_type"] for n in nodes)
-    # The fusion scope is exactly the two branch seams: 8 SLA2 layers ->
-    # 8 forward + 8 backward virtual ops per branch. Everything around them
-    # stays native (topk, sigmoid, RoPE complex views still captured).
+    # The fusion scope is the four production seams (8 SLA2 layers): the two
+    # SLA2 branch seams (8 forward + 8 backward virtual ops per branch), the
+    # router seam (topk absorbed into the soft-topk virtual pair) and the
+    # MoE FFN activation seam (swiglu virtual pair). Everything around them
+    # stays native (the remaining sigmoid is still captured eagerly).
     assert counts[_SPARSE_FWD] == 8
     assert counts[_LINEAR_FWD] == 8
     assert counts[_SPARSE_BWD] == 8
     assert counts[_LINEAR_BWD] == 8
-    assert counts["aten.topk.default"] == 8
-    assert counts["aten.sigmoid.default"] == 16
-    assert counts["aten.view_as_complex.default"] == 32
+    assert counts[_ROUTER_FWD] == 8
+    assert counts[_ROUTER_BWD] == 8
+    assert counts[_SWIGLU_FWD] == 12
+    assert counts[_SWIGLU_BWD] == 12
+    assert counts["aten.sigmoid.default"] == 8
+    assert not any(raw.startswith("aten.") and "topk" in raw for raw in counts)
     assert not any(
         raw.startswith("aten.") and "masked_fill" in raw for raw in counts
     )  # the score masking now lives inside the fused boundary
 
     # The fused ops carry declared tensor semantics; no eager node does.
     custom = [n for n in nodes if "tensor_semantics" in n.attrs]
-    assert {n.annotations["raw_op_type"] for n in custom} == {_SPARSE_FWD, _SPARSE_BWD, _LINEAR_FWD, _LINEAR_BWD}
+    assert {n.annotations["raw_op_type"] for n in custom} == {
+        _SPARSE_FWD,
+        _SPARSE_BWD,
+        _LINEAR_FWD,
+        _LINEAR_BWD,
+        _ROUTER_FWD,
+        _ROUTER_BWD,
+        _SWIGLU_FWD,
+        _SWIGLU_BWD,
+    }
 
     # Mask gradient routing matches the eager reference per branch (PR #19
     # review): the sparse mask enters the eager branch through the boolean

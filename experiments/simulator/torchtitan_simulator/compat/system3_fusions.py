@@ -50,7 +50,7 @@ _GDN2_MASK = ("mask", TensorMeaning("padding_mask", _MASK_AXES, optional=True))
 _GDN2_OUTPUT = TensorMeaning("attention_output", _V_AXES)
 
 
-@torch.library.custom_op("fused::swiglu_clamp", mutates_args=())
+@torch.library.custom_op("system3_sim::swiglu_clamp", mutates_args=())
 def swiglu_clamp(x: torch.Tensor, gate: torch.Tensor, clamp_val: float | None) -> torch.Tensor:
     raise RuntimeError("system3 virtual swiglu_clamp is available only for Meta simulation")
 
@@ -60,7 +60,7 @@ def _swiglu_clamp_meta(x, gate, clamp_val):
     return torch.empty_like(x)
 
 
-@torch.library.custom_op("fused::swiglu_clamp_backward", mutates_args=())
+@torch.library.custom_op("system3_sim::swiglu_clamp_backward", mutates_args=())
 def swiglu_clamp_backward(
     x: torch.Tensor, gate: torch.Tensor, dy: torch.Tensor, clamp_val: float | None
 ) -> list[torch.Tensor]:
@@ -84,7 +84,7 @@ def _swiglu_backward(ctx, dy):
 swiglu_clamp.register_autograd(_swiglu_backward, setup_context=_swiglu_setup)
 
 
-@torch.library.custom_op("fused::gdn2_chunked", mutates_args=())
+@torch.library.custom_op("system3_sim::gdn2_chunked", mutates_args=())
 def gdn2_chunked(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -103,7 +103,7 @@ def _gdn2_chunked_meta(q, k, v, alpha, beta_erase, beta_write, da_gain, mask):
     return torch.empty_like(v)
 
 
-@torch.library.custom_op("fused::gdn2_chunked_backward", mutates_args=())
+@torch.library.custom_op("system3_sim::gdn2_chunked_backward", mutates_args=())
 def gdn2_chunked_backward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -212,7 +212,7 @@ def _isa_indexer_geometry(idx_q, idx_k_c):
     return b, s, width, idx_k_c.shape[1]
 
 
-@torch.library.custom_op("fused::isa_indexer", mutates_args=())
+@torch.library.custom_op("system3_sim::isa_indexer", mutates_args=())
 def isa_indexer(
     idx_q: torch.Tensor,
     idx_k_c: torch.Tensor,
@@ -238,7 +238,7 @@ def _isa_indexer_meta(idx_q, idx_k_c, mask, topk, compress_ratio):
     return indices, scores
 
 
-@torch.library.custom_op("fused::isa_indexer_grad", mutates_args=())
+@torch.library.custom_op("system3_sim::isa_indexer_grad", mutates_args=())
 def isa_indexer_grad(
     idx_q: torch.Tensor,
     idx_k_c: torch.Tensor,
@@ -306,7 +306,7 @@ def _isa_attention_geometry(q, k, v, indices, bias):
     return b, s, heads, width, k.shape[1]
 
 
-@torch.library.custom_op("fused::isa_sparse_attention", mutates_args=())
+@torch.library.custom_op("system3_sim::isa_sparse_attention", mutates_args=())
 def isa_sparse_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -340,7 +340,7 @@ def _isa_sparse_attention_meta(q, k, v, indices, bias, mask, scale, clamp_val, c
     return out, lse
 
 
-@torch.library.custom_op("fused::isa_sparse_attention_grad", mutates_args=())
+@torch.library.custom_op("system3_sim::isa_sparse_attention_grad", mutates_args=())
 def isa_sparse_attention_grad(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -468,7 +468,7 @@ _MHC_MIX = TensorMeaning("mix_matrix", _MHC_MIX_AXES, unknown_leading_axes=True)
 _MHC_MIXED = TensorMeaning("normalized_mix", _MHC_MIX_AXES, unknown_leading_axes=True)
 
 
-@torch.library.custom_op("fused::mhc_sinkhorn", mutates_args=())
+@torch.library.custom_op("system3_sim::mhc_sinkhorn", mutates_args=())
 def mhc_sinkhorn(w: torch.Tensor, n_iters: int, clamp_exp: float, clamp_denom: float) -> torch.Tensor:
     raise RuntimeError("system3 virtual mhc_sinkhorn is available only for Meta simulation")
 
@@ -488,7 +488,7 @@ def _mhc_sinkhorn_meta(w, n_iters, clamp_exp, clamp_denom):
     return torch.empty_like(w)
 
 
-@torch.library.custom_op("fused::mhc_sinkhorn_backward", mutates_args=())
+@torch.library.custom_op("system3_sim::mhc_sinkhorn_backward", mutates_args=())
 def mhc_sinkhorn_backward(
     w: torch.Tensor,
     dy: torch.Tensor,
@@ -530,7 +530,7 @@ def _mhc_sinkhorn_backward(ctx, dy):
 mhc_sinkhorn.register_autograd(_mhc_sinkhorn_backward, setup_context=_mhc_sinkhorn_setup)
 
 
-@torch.library.custom_op("fused::engram_hash", mutates_args=())
+@torch.library.custom_op("system3_sim::engram_hash", mutates_args=())
 def engram_hash(ids: torch.Tensor, multipliers: torch.Tensor, capacity: int, order: int) -> torch.Tensor:
     raise RuntimeError("system3 virtual engram_hash is available only for Meta simulation")
 
@@ -561,7 +561,7 @@ def _register_engram_hash_semantics() -> None:
     )
 
 
-@torch.library.custom_op("fused::engram_gate", mutates_args=())
+@torch.library.custom_op("system3_sim::engram_gate", mutates_args=())
 def engram_gate(
     x: torch.Tensor,
     table: torch.Tensor,
@@ -599,7 +599,7 @@ def _engram_gate_meta(x, table, value, q_weight, k_weight, out_weight, ids, epsi
     return torch.empty(x.shape, dtype=promoted, device=x.device)
 
 
-@torch.library.custom_op("fused::engram_gate_backward", mutates_args=())
+@torch.library.custom_op("system3_sim::engram_gate_backward", mutates_args=())
 def engram_gate_backward(
     x: torch.Tensor,
     table: torch.Tensor,

@@ -56,7 +56,7 @@ def test_real_training_delivers_custom_semantics_with_local_shapes(config, world
     assert reroute.inputs[1].shape == (2, 2 if config.startswith("deepseek") else 4)
     if config.startswith("kimi"):
         attention = next(
-            node for node in custom if node.annotations["raw_op_type"] == "fused.fusion_attention.default"
+            node for node in custom if node.annotations["raw_op_type"] == "kimi_sim.fusion_attention.default"
         )
         assert attention.attrs["tensor_semantics"]["inputs"][0] == {
             "index": 0,
