@@ -71,6 +71,8 @@ def mhc_mix_backward(
     weight: torch.Tensor,
     base: torch.Tensor,
     scale: torch.Tensor,
+    eps: float,
+    sinkhorn_iters: int,
     upstream_pre: torch.Tensor,
     upstream_post: torch.Tensor,
     upstream_matrix: torch.Tensor,
@@ -81,7 +83,11 @@ def mhc_mix_backward(
 
 
 @mhc_mix_backward.register_fake
-def _mhc_mix_backward_meta(stream, weight, base, scale, upstream_pre, upstream_post, upstream_matrix):
+def _mhc_mix_backward_meta(
+    stream, weight, base, scale, eps, sinkhorn_iters, upstream_pre, upstream_post, upstream_matrix
+):
+    if eps <= 0 or sinkhorn_iters < 0:
+        raise ValueError("mhc mix backward epsilon must be positive and iterations nonnegative")
     batch, seq, n = stream.shape[:3]
     if upstream_pre.shape != (batch, seq, n) or upstream_post.shape != (batch, seq, n):
         raise ValueError("mhc mix backward gate gradients must match the stream grid")
@@ -97,11 +103,15 @@ def _mhc_mix_backward_meta(stream, weight, base, scale, upstream_pre, upstream_p
 
 def _mix_setup(ctx, inputs, output):
     ctx.save_for_backward(inputs[0], inputs[1], inputs[2], inputs[3])
+    ctx.eps = inputs[4]
+    ctx.sinkhorn_iters = inputs[5]
 
 
 def _mix_backward(ctx, grad_pre, grad_post, grad_matrix):
     stream, weight, base, scale = ctx.saved_tensors
-    grads = mhc_mix_backward(stream, weight, base, scale, grad_pre, grad_post, grad_matrix)
+    grads = mhc_mix_backward(
+        stream, weight, base, scale, ctx.eps, ctx.sinkhorn_iters, grad_pre, grad_post, grad_matrix
+    )
     return (*grads, None, None)
 
 
