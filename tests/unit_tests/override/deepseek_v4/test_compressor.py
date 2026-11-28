@@ -49,12 +49,28 @@ def test_compressor_override_composes_with_norm_and_rope(monkeypatch, reverse):
     )
 
 
+_CV_METADATA_MODULE = "torchtitan_npu.extensions.experiment.cv_parallel.batch_chunk_metadata"
+
+
+@pytest.fixture
+def _override_registry_isolation():
+    """Make sure the CV-parallel metadata override is registered.
+
+    ``apply_overrides`` only reads the registry (resolving each target it is
+    asked to apply), so one registration from the module's first import serves
+    every case; re-registering would in fact raise ("already registered").
+    The registry must not be swapped per case: a copy drops the registration
+    once the module is cached, and re-importing a dropped module breaks type
+    identity for other tests.
+    """
+    importlib.import_module(_CV_METADATA_MODULE)
+    yield
+
+
 @pytest.mark.parametrize("fused", [False, True])
 @pytest.mark.parametrize("batch_chunk", [False, True])
 @pytest.mark.parametrize("reverse", [False, True])
-def test_compressor_metadata_selection(dsv4, monkeypatch, fused, batch_chunk, reverse):
-    registry = importlib.import_module("torchtitan.config.override")
-    monkeypatch.setattr(registry, "_REGISTRY", registry._REGISTRY.copy())
+def test_compressor_metadata_selection(dsv4, _override_registry_isolation, monkeypatch, fused, batch_chunk, reverse):
     cfg = _debugmodel()
     metadata_target = (
         "torchtitan_npu.extensions.experiment.cv_parallel.batch_chunk_metadata.asc_metadata"

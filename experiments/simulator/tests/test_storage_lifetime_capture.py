@@ -7,6 +7,7 @@
 
 import pytest
 from torchtitan_simulator.capture import storage_lifetimes
+from torchtitan_simulator.compat.torchao_capture import mx_capture_routes_to_quant_matmul
 from torchtitan_simulator.config import SimulationConfig
 from torchtitan_simulator.runner import simulate
 
@@ -35,6 +36,8 @@ from torchtitan_simulator.runner import simulate
     ids=["hsdp", "hsdp-full-ac", "hsdp-selective-mxfp8", "tp-cp-ep-hsdp"],
 )
 def test_native_capture_releases_match_full_scan_at_every_boundary(monkeypatch, options):
+    if options.get("enable_quantized_training") and not mx_capture_routes_to_quant_matmul():
+        pytest.skip("torchao-npu build degrades the meta-capture MX matmul to aten.mm")
     checks = []
     original = storage_lifetimes.StorageLifetimeTracker
 

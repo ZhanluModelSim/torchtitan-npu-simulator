@@ -8,6 +8,7 @@
 import pytest
 import torch
 from torchtitan_simulator.cli import main
+from torchtitan_simulator.compat.torchao_capture import mx_capture_routes_to_quant_matmul
 from torchtitan_simulator.config import SimulationConfig, build_meta_model, prepare_config
 from torchtitan_simulator.runtime import meta_runtime
 
@@ -32,6 +33,8 @@ def test_native_base_dtype_overrides_process_default_and_restores_it(dtype):
 @pytest.mark.parametrize("mode", ["none", "full", "selective"])
 @pytest.mark.parametrize("quantized", [False, True], ids=["dense", "mxfp8"])
 def test_native_precision_cli_reaches_fsdp_backward_and_optimizer(param_dtype, mode, quantized, tmp_path):
+    if quantized and not mx_capture_routes_to_quant_matmul():
+        pytest.skip("torchao-npu build degrades the meta-capture MX matmul to aten.mm")
     arguments = [
         "--simulation.world-size",
         "4",

@@ -48,9 +48,11 @@ def apply() -> None:
             _LoweringGuard,
             exclude,
         )
-    except ModuleNotFoundError:
-        # The AscendC lowering module is absent in this torch_npu build; the
-        # workaround degrades gracefully (no D2H event synchronization).
+    except (ModuleNotFoundError, RuntimeError):
+        # The AscendC lowering module is absent in this torch_npu build, or its
+        # import-time inductor backend load cannot initialize an NPU device (e.g.
+        # the simulator container has only the driver); the workaround degrades
+        # gracefully (no D2H event synchronization).
         return
 
     cast("Any", inductor_ir.DeviceCopy).create = classmethod(_patched_device_copy_create)

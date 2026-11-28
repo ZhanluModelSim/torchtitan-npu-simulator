@@ -25,6 +25,36 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from torchtitan_simulator.capture.checkpoint_execution import current_execution_kind
 from torchtitan_simulator.capture.op_mapping import is_metadata_view_op, to_canonical_op_type
+
+_MIXED_PRECISION_PROJECTIONS = frozenset(
+    {
+        "aten.mm.default",
+        "aten.bmm.default",
+        "aten.matmul.default",
+        "aten.addmm.default",
+    }
+)
+
+
+def _mixed_precision_compute(raw_op_type: str, args: tuple[Any, ...]) -> str | None:
+    """Compute-precision fact for mixed-dtype projections under autocast.
+
+    The parameter view (FSDP2 ``param_dtype``) is the autocast target, so when
+    matmul operands mix master float32 activations with bf16 parameter views the
+    real kernel computes in the narrower dtype. Returns None when operands are
+    uniform (no ambiguity) or the mix is not the master-vs-view pattern.
+    """
+    tensors = [
+        arg
+        for arg in args
+        if isinstance(arg, torch.Tensor) and arg.is_floating_point() and arg.dim() >= 1
+    ]
+    if len(tensors) < 2:
+        return None
+    dtypes = {str(tensor.dtype).removeprefix("torch.") for tensor in tensors}
+    if len(dtypes) < 2 or "bfloat16" not in dtypes or "float32" not in dtypes:
+        return None
+    return "bfloat16"
 from torchtitan_simulator.capture.operator_arguments import operator_attributes
 from torchtitan_simulator.capture.tensor_semantics import attach_tensor_semantics
 from torchtitan_simulator.capture.tensor_utils import dtype_to_str, tensor_volume_bytes, to_tensor_meta
@@ -232,6 +262,75 @@ def _to_tensor_ref(
     )
 
 
+def _balanced_group_offsets_from_proof(
+    events: list[_RawEvent],
+    args: tuple[Any, ...],
+    result: Any,
+) -> tuple[int, ...] | None:
+    """Derive ``aten._grouped_mm`` offs ends from the certified balanced-EP facts.
+
+    Meta captures carry no tensor values, so the offs ends cannot be read at
+    dispatch time. Two certified fact sources exist: the dispatcher
+    instrumentation (``torchtitan_balanced_ep_v1``) and the router forward
+    hooks (``debug_round_robin_balanced_v1``), both proving that expert ids
+    are the round-robin balanced assignment. That fixes the per-expert token
+    counts: the ends are the cumulative balanced split of the routed
+    assignments. The fact is recorded with that provenance rather than
+    guessed from shapes alone: a proof with any other geometry (multi-rank
+    EP groups, mismatched assignments) keeps the node unfactored.
+    """
+    tensors = [value for value in args if isinstance(value, torch.Tensor)]
+    if len(tensors) < 2:
+        return None
+    lhs, rhs = tensors[0], tensors[1]
+    count: int | None
+    rows: int | None
+    if len(lhs.shape) == 2 and len(rhs.shape) == 3:
+        rows, count = lhs.shape[0], rhs.shape[0]
+    elif len(lhs.shape) == 2 and len(rhs.shape) == 2 and isinstance(result, torch.Tensor) and len(result.shape) == 3:
+        rows, count = lhs.shape[1], result.shape[0]
+    else:
+        return None
+    if not rows or not count:
+        return None
+    proof = None
+    from torchtitan_simulator.compat.routing import certified_balanced_proofs
+
+    for candidate in certified_balanced_proofs():
+        if not candidate.get("all_routers_force_load_balance"):
+            continue
+        experts = candidate.get("num_experts")
+        if type(experts) is not int or experts != count:
+            continue
+        kind = candidate.get("kind")
+        if kind == "torchtitan_balanced_ep_v1":
+            group = candidate.get("ordered_group") or []
+            per_rank = candidate.get("num_tokens_per_rank") or []
+            top_k = candidate.get("top_k")
+            if len(group) != 1 or not per_rank or type(top_k) is not int:
+                continue
+            if per_rank[0] * top_k != rows:
+                continue
+        elif kind == "debug_round_robin_balanced_v1":
+            assignments = candidate.get("assignments")
+            if type(assignments) is not int or assignments != rows:
+                continue
+        else:
+            continue
+        proof = candidate
+        break
+    if proof is None:
+        return None
+    quotient, remainder = divmod(rows, experts)
+    counts = [quotient + 1] * remainder + [quotient] * (experts - remainder)
+    ends: list[int] = []
+    running = 0
+    for value in counts:
+        running += value
+        ends.append(running)
+    return tuple(ends)
+
+
 class OpDispatchCapture(TorchDispatchMode):
     """Records one L0 op stream. Usage::
 
@@ -418,6 +517,21 @@ class OpDispatchCapture(TorchDispatchMode):
                 argument.name: kwargs[argument.name] for argument in func._schema.arguments if argument.name in kwargs
             }
         attrs = operator_attributes(func, args, attribute_kwargs)
+        if str(func) in _MIXED_PRECISION_PROJECTIONS:
+            compute_precision = _mixed_precision_compute(str(func), args)
+            if compute_precision is not None:
+                # Autocast semantics: FSDP2 materializes the bf16 parameter view
+                # while the captured activation stream keeps master fp32; the
+                # real kernel computes in the parameter-view dtype. Record the
+                # fact explicitly so the cost model never guesses precision.
+                attrs["compute_precision"] = compute_precision
+        from torchtitan_simulator.capture.operator_arguments import grouped_mm_group_offsets
+
+        attrs.update(grouped_mm_group_offsets(func, args, kwargs or {}))
+        if str(func) in {"aten._grouped_mm.default", "aten._grouped_mm"} and "group_offsets" not in attrs:
+            offsets = _balanced_group_offsets_from_proof(self._events, args, result)
+            if offsets is not None:
+                attrs["group_offsets"] = offsets
         if str(func) == "aten._fused_adamw_.default":
             from torchtitan_simulator.capture.optimizer import bind_fused_adamw_inputs, optimizer_annotations
 
@@ -437,6 +551,12 @@ class OpDispatchCapture(TorchDispatchMode):
             attrs.update(operands.attributes())
         if collective_facts is not None:
             attrs["collective_facts"] = collective_facts
+        from torchtitan_simulator.capture.collective_facts import active_op_attributes
+
+        op_attribute_payload = active_op_attributes()
+        if op_attribute_payload and op_attribute_payload.get("raw_name") == str(func):
+            for key, value in op_attribute_payload["attributes"].items():
+                attrs.setdefault(key, value)
         module_path = self.module_path_tracker.current_path() if self.module_path_tracker else ""
         op_id = self._record_event(
             str(func),

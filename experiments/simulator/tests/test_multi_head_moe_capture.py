@@ -21,6 +21,10 @@ _SPARSE_FWD = "multi_head_moe_sim.sla2_sparse_attention.default"
 _SPARSE_BWD = "multi_head_moe_sim.sla2_sparse_attention_grad.default"
 _LINEAR_FWD = "multi_head_moe_sim.sla2_linear_attention.default"
 _LINEAR_BWD = "multi_head_moe_sim.sla2_linear_attention_grad.default"
+_ROUTER_FWD = "multi_head_moe_sim.router_soft_topk.default"
+_ROUTER_BWD = "multi_head_moe_sim.router_soft_topk_backward.default"
+_SWIGLU_FWD = "multi_head_moe_sim.swiglu.default"
+_SWIGLU_BWD = "multi_head_moe_sim.swiglu_backward.default"
 
 _D, _V, _HID = 256, 102400, 512
 _H, _HD, _PROJ = 4, 64, 64
@@ -325,7 +329,10 @@ def _head_parallel_two_rank_worker(rank: int, rendezvous: str, queue) -> None:
         torch.set_num_threads(1)
         mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("ep",))
         base_cfg = _moe_layer_module_config(bias=False)
-        with torch.random.fork_rng():
+        # Devices=[] keeps the fork CPU-only: this worker runs meta/cpu math
+        # and a default fork_rng() would touch the NPU rng state, which
+        # cannot re-initialize in a forked subprocess.
+        with torch.random.fork_rng(devices=[]):
             torch.manual_seed(313)
             module = HeadParallelMultiHeadMoE.Config(
                 **{field.name: getattr(base_cfg, field.name) for field in dataclasses.fields(base_cfg) if field.init}
@@ -465,23 +472,37 @@ def test_multi_head_moe_opt_in_fusion_replaces_only_the_two_branch_seams():
     assert result["graph_acyclic"] and result["peak_storage_unique"]
     nodes = [n for template in workload.step_templates.values() for n in template.nodes.values()]
     counts = Counter(n.annotations["raw_op_type"] for n in nodes)
-    # The fusion scope is exactly the two branch seams: 8 SLA2 layers ->
-    # 8 forward + 8 backward virtual ops per branch. Everything around them
-    # stays native (topk, sigmoid, RoPE complex views still captured).
+    # The fusion scope is the four production seams (8 SLA2 layers): the two
+    # SLA2 branch seams (8 forward + 8 backward virtual ops per branch), the
+    # router seam (topk absorbed into the soft-topk virtual pair) and the
+    # MoE FFN activation seam (swiglu virtual pair). Everything around them
+    # stays native (the remaining sigmoid is still captured eagerly).
     assert counts[_SPARSE_FWD] == 8
     assert counts[_LINEAR_FWD] == 8
     assert counts[_SPARSE_BWD] == 8
     assert counts[_LINEAR_BWD] == 8
-    assert counts["aten.topk.default"] == 8
-    assert counts["aten.sigmoid.default"] == 16
-    assert counts["aten.view_as_complex.default"] == 32
+    assert counts[_ROUTER_FWD] == 8
+    assert counts[_ROUTER_BWD] == 8
+    assert counts[_SWIGLU_FWD] == 12
+    assert counts[_SWIGLU_BWD] == 12
+    assert counts["aten.sigmoid.default"] == 8
+    assert not any(raw.startswith("aten.") and "topk" in raw for raw in counts)
     assert not any(
         raw.startswith("aten.") and "masked_fill" in raw for raw in counts
     )  # the score masking now lives inside the fused boundary
 
     # The fused ops carry declared tensor semantics; no eager node does.
     custom = [n for n in nodes if "tensor_semantics" in n.attrs]
-    assert {n.annotations["raw_op_type"] for n in custom} == {_SPARSE_FWD, _SPARSE_BWD, _LINEAR_FWD, _LINEAR_BWD}
+    assert {n.annotations["raw_op_type"] for n in custom} == {
+        _SPARSE_FWD,
+        _SPARSE_BWD,
+        _LINEAR_FWD,
+        _LINEAR_BWD,
+        _ROUTER_FWD,
+        _ROUTER_BWD,
+        _SWIGLU_FWD,
+        _SWIGLU_BWD,
+    }
 
     # Mask gradient routing matches the eager reference per branch (PR #19
     # review): the sparse mask enters the eager branch through the boolean

@@ -479,6 +479,26 @@ def test_v41_recipe_rejects_non_mxfp4_lightning_indexer(converter_module, li_qua
         )
 
 
+def _torchao_li_metadata_available() -> bool:
+    """Whether the installed torchao-npu ships the V4 LI metadata provider.
+
+    The V4.1 compressor conversion wraps ``QuantizedLightningIndexerMetadata``
+    from ``torchao_npu.quantized_modules.deepseek_v4.lightning_indexer_metadata``;
+    torchao-npu builds without that module keep the compressor conversion
+    unsupported, and those cases skip instead of failing on the import.
+    """
+    try:
+        import torchao_npu.quantized_modules.deepseek_v4.lightning_indexer_metadata  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+_TORCHAO_LI_METADATA = _torchao_li_metadata_available()
+
+
+@pytest.mark.skipif(not _TORCHAO_LI_METADATA, reason="torchao-npu build ships no V4 LI metadata provider")
 @pytest.mark.parametrize("ratio", [1, 2], ids=["full-resolution", "compressed"])
 def test_converted_v41_compressor_quantizes_post_rope_and_preserves_gradients(converter_module, monkeypatch, ratio):
     from torchtitan_npu.config.configs import QuantizationExtensionConfig

@@ -71,10 +71,16 @@ def _reduce_op_literal(value: Any) -> str | None:
             return None
         # Native ReduceOp accessors are absent from torch's Python stubs.
         operation = cast("Any", value).op()
-    elif isinstance(value, ReduceOp):
-        operation = cast("Any", value).op
     elif isinstance(value, ReduceOp.RedOpType):
+        # pybind enum members expose .value; some builds deliver these directly
+        # where older APIs wrapped them in a ReduceOp with an .op accessor.
         operation = cast("Any", value).value
+    elif isinstance(value, ReduceOp):
+        operation = cast("Any", getattr(value, "op", None))
+        if operation is None:
+            # Opaque native premul wrappers expose neither a numeric id nor the
+            # factor; preserve the same unsupported identity as ScriptObject.
+            return "unsupported:premul_sum"
     else:
         return None
 
@@ -149,3 +155,37 @@ def operator_attributes(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
     if bindings_complete:
         attrs["input_tensor_bindings"] = tuple(bindings)
     return attrs
+
+
+_GROUPED_MM_SPELLINGS = frozenset(
+    {
+        "aten._grouped_mm.default",
+        "aten._grouped_mm",
+    }
+)
+
+
+def grouped_mm_group_offsets(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Capture the ``offs`` argument's cumulative group ends as a value fact.
+
+    The operator-performance-models grouped-matmul contract prices uneven
+    expert splits only from captured group facts (``provided_offsets``);
+    inventing a balanced split is forbidden there. The offs tensor is part of
+    the captured call, so its cumulative ends are a source fact rather than a
+    guess. Meta-device captures carry no storage: the fact stays absent and
+    only divisible geometries keep the balanced shortcut.
+    """
+    if str(func) not in _GROUPED_MM_SPELLINGS:
+        return {}
+    offs = kwargs.get("offs")
+    if offs is None and len(args) >= 3:
+        offs = args[2]
+    if not isinstance(offs, torch.Tensor) or offs.is_meta or offs.numel() == 0:
+        return {}
+    try:
+        values = offs.detach().to("cpu", torch.int64).tolist()
+    except Exception:
+        return {}
+    if not values or not all(type(value) is int and value >= 0 for value in values):
+        return {}
+    return {"group_offsets": tuple(values)}

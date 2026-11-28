@@ -10,7 +10,8 @@ import torch_npu
 
 try:
     _IS_A5 = torch_npu.npu.get_device_name().startswith("Ascend950")
-except (AttributeError, TypeError):
-    # CPU/UT runs may not have a current NPU device selected.  Keep the
-    # non-A5 behavior in that case.
+except (AttributeError, TypeError, RuntimeError):
+    # CPU/UT runs -- or the simulator container with only the NPU driver --
+    # may not have a current NPU device to initialize.  Keep the non-A5
+    # behavior in that case.
     _IS_A5 = False

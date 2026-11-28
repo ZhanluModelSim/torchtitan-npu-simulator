@@ -195,10 +195,30 @@ def _bmm_cost(inputs: list[TensorMeta], outputs: list[TensorMeta], hardware=None
     return estimate
 
 
-def _grouped_mm_cost(inputs: list[TensorMeta], outputs: list[TensorMeta], hardware=None) -> CostEstimate:
+def _grouped_mm_cost(
+    inputs: list[TensorMeta],
+    outputs: list[TensorMeta],
+    hardware=None,
+    attrs: dict | None = None,
+) -> CostEstimate:
     """``aten._grouped_mm``: 2D packed, per-expert 3D and backward weight
-    gradients, routed through the package's grouped-matmul family."""
-    estimate = _routed_cost("GroupedMm", "aten._grouped_mm.default", inputs, outputs, hardware)
+    gradients, routed through the package's grouped-matmul family.
+
+    The package prices uneven expert splits only from captured group facts,
+    so the capture's ``offs`` value fact (``group_offsets``, cumulative ends)
+    is forwarded verbatim; every other captured attribute stays out of the
+    grouped-matmul attribute contract.
+    """
+    facts: dict = {}
+    offsets = (attrs or {}).get("group_offsets")
+    if offsets:
+        try:
+            captured = tuple(int(value) for value in offsets)
+        except (TypeError, ValueError):
+            captured = ()
+        if captured and all(type(value) is int for value in captured):
+            facts["group_offsets"] = captured
+    estimate = _routed_cost("GroupedMm", "aten._grouped_mm.default", inputs, outputs, hardware, facts)
     if estimate is None:
         return CostEstimate.unknown_cost()
     return estimate
@@ -354,7 +374,7 @@ def _sla2_sparse_attention_cost(
     hardware=None,
     attrs: dict | None = None,
 ) -> CostEstimate:
-    """``multi_head_moe_sim.sla2_sparse_attention`` (+ grad) via the library model."""
+    """``multi_head_moe_sla2_sparse_attention`` (+ grad) via the library model."""
     return _sla2_library_cost(
         "sla2_sparse_attention" if len(outputs) == 1 else "sla2_sparse_attention_gradient",
         inputs,
@@ -370,7 +390,7 @@ def _sla2_linear_attention_cost(
     hardware=None,
     attrs: dict | None = None,
 ) -> CostEstimate:
-    """``multi_head_moe_sim.sla2_linear_attention`` (+ grad) via the library model."""
+    """``multi_head_moe_sla2_linear_attention`` (+ grad) via the library model."""
     return _sla2_library_cost(
         "sla2_linear_attention" if len(outputs) == 1 else "sla2_linear_attention_gradient",
         inputs,

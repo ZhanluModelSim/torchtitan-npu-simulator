@@ -8,7 +8,7 @@
 The production Qwen3.5 path binds the Triton-Ascend GatedDeltaRule kernel
 (``torchtitan_npu.ops.triton.gdn``); Triton cannot execute on Meta, so the
 simulator exposes the same fusion boundary as a virtual custom op with a fake
-Meta kernel and an explicit backward op, mirroring Kimi's ``kimi_sim`` fusions.
+Meta kernel and an explicit backward op, mirroring the Kimi fused-boundary fusions.
 Real-device calls fail explicitly.
 
 The upstream model owns its input path through ``get_attention_masks`` and the

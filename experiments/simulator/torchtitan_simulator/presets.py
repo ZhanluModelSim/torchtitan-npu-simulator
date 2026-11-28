@@ -5,6 +5,8 @@
 
 """Retain the legacy Pro 20T geometry using native config-tree construction."""
 
+import os
+
 from dataclasses import replace
 
 
@@ -78,6 +80,36 @@ def multi_head_moe_debugmodel_head_parallel(*, num_mtp_layers: int = 0):
     return _factory()
 
 
+def multi_head_moe_2p5t(*, num_mtp_layers: int = 0):
+    """SLA2 + Multi-Head-MoE trainer at the published 2.5T preview geometry.
+
+    Field-for-field from the pristine reference ``ModelArgs``: dim=8192,
+    80 layers, 64 heads x 128 hd, MoE 32 heads x 896 experts-per-head with
+    K=16, 1536-wide routed experts, 4096-wide shared expert, vocab 102400.
+    """
+    if num_mtp_layers:
+        raise ValueError("multi_head_moe has no MTP modules; num_mtp_layers must be 0")
+    from torchtitan_npu.models.multi_head_moe.config_registry import multi_head_moe_2p5t as _factory
+
+    return _factory()
+
+
+def multi_head_moe_2p5t_head_parallel(*, num_mtp_layers: int = 0):
+    """Head-parallel variant of the 2.5T-geometry SLA2 + Multi-Head-MoE trainer.
+
+    Same 2.5T geometry; the MoE layers swap to ``HeadParallelMultiHeadMoE``
+    (static head-ownership all-to-alls instead of token-choice dispatch).
+    ``moe_heads`` 32 accepts expert parallel degrees up to 32.
+    """
+    if num_mtp_layers:
+        raise ValueError("multi_head_moe has no MTP modules; num_mtp_layers must be 0")
+    from torchtitan_npu.models.multi_head_moe.config_registry import (
+        multi_head_moe_2p5t_head_parallel as _factory,
+    )
+
+    return _factory()
+
+
 def _deepseek_v4_1_trainer_config(factory_name: str, *, num_mtp_layers: int = 0):
     """Build a native DeepSeek-V4.1 TrainerEx.Config through the main package.
 
@@ -94,6 +126,24 @@ def _deepseek_v4_1_trainer_config(factory_name: str, *, num_mtp_layers: int = 0)
 
 def deepseek_v4_1_debugmodel_text(*, num_mtp_layers: int = 0):
     return _deepseek_v4_1_trainer_config("deepseek_v4_1_debugmodel_text", num_mtp_layers=num_mtp_layers)
+
+
+def deepseek_v4_1_flash_text(*, num_mtp_layers: int = 0):
+    trainer = _deepseek_v4_1_trainer_config("deepseek_v4_1_flash_text", num_mtp_layers=num_mtp_layers)
+    # The published Flash Engram geometry requires tokenizer compression to a
+    # 99092-entry canonical vocabulary, but the real DeepSeek-V4.1-Flash tokenizer
+    # assets are unavailable in the simulation environment. Point the tables at a
+    # synthetic map with the validated compressed size: require_token_id_map and
+    # compressed_vocab_size keep the published values, the map-loading path stays
+    # active, and only the token->row assignment differs -- invisible to graph
+    # structure, memory and performance simulation.
+    map_path = os.environ.get(
+        "TORCHTITAN_ENGRAM_TOKEN_ID_MAP", "/workspace/assets/engram_token_id_map.npy"
+    )
+    for layer in trainer.model_spec.model.layers:
+        if layer.engram is not None:
+            layer.engram.table.token_id_map_path = map_path
+    return trainer
 
 
 def deepseek_v4_pro_20t(*, num_mtp_layers=0):

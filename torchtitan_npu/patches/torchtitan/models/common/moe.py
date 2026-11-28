@@ -501,8 +501,16 @@ def apply() -> None:
 
     import torchtitan.models.common.config_utils
 
+    # The swaps above are import-time attributes of the patched modules, so a
+    # ``config_utils`` that was already imported earlier in the process (any
+    # prior test or model registry import) keeps its own module-level bindings
+    # frozen on the originals. Rebind the swapped names there too, or the
+    # factories keep building unpatched router/MoE configs and multimodal
+    # extensions (``vision_enabled`` / ``sorted_topk``) fail their replace().
     torchtitan.models.common.config_utils.GroupedExperts = _ClampGroupedExperts
     torchtitan.models.common.config_utils.RoutedExperts = _RouterScoreAbsorbingRoutedExperts
+    torchtitan.models.common.config_utils.MoE = HashMoE
+    torchtitan.models.common.config_utils.TokenChoiceTopKRouter = HashRouter
 
     global _original_make_routed_experts_config, _original_make_ffn_config
     _original_make_routed_experts_config = torchtitan.models.common.config_utils.make_routed_experts_config

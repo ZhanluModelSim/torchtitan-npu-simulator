@@ -149,10 +149,14 @@ def _assert_coalesced_microbatch_gradients(rank, rendezvous, dtype):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 def test_coalesced_chunk_loss_uses_one_rs_and_preserves_microbatch_gradients(tmp_path, dtype):
+    # Spawn (not fork): earlier tests leave autograd engine threads behind,
+    # and a forked child that runs backward then trips autograd's
+    # "threading in combination with fork" guard. A spawned process starts
+    # from a clean interpreter and owns its own autograd engine.
     mp.start_processes(
         _assert_coalesced_microbatch_gradients,
         args=(str(tmp_path / "rendezvous"), dtype),
         nprocs=2,
         join=True,
-        start_method="fork",
+        start_method="spawn",
     )

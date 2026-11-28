@@ -144,6 +144,16 @@ class _Geometry:
     enc_hidden: int = 48
     enc_layers: int = 2
     enc_heads: int = 4
+    # Audio and haptic keep their own stem widths (the 40T preview sizes
+    # audio 768/8/12 and haptic 512/6/8 separately); the defaults mirror the
+    # shared small-geometry values so existing flavors stay byte-identical.
+    audio_hidden: int = 48
+    audio_layers: int = 2
+    audio_heads: int = 4
+    audio_conv_kernel: int = 4
+    audio_conv_stride: int = 2
+    haptic_conv_kernel: int = 4
+    haptic_conv_stride: int = 2
     conv_kernel: int = 4
     conv_stride: int = 2
     max_frames: int = 64
@@ -190,8 +200,129 @@ _FULL_GEOMETRY = _Geometry(
     engram_rows=4096,
 )
 
-# Minimal structural unit of the full geometry: one joint ISA/engram period.
-# ISA recurs every 4 layers, engram every 6, so the joint period is lcm(4,6)=12
+# The published 40T compute-equivalent preview (``FlashConfig.preset_40T``)
+# transcribed verbatim: 100 physical layers x loop 2 (200 logical depth),
+# 4096 routed experts top-25 + 1 shared, LatentMoE bottleneck 4096,
+# inter 4096, Engram 2.06T host tables on 10 inject layers (MoE replaced),
+# 5 modality encoders, vocab 524288, 8M context. ~20.7T stored parameters;
+# no field was re-tuned from the reference preset.
+_PREVIEW40T_GEOMETRY = _Geometry(
+    hidden_size=16384,
+    vocab_size=524288,
+    base_depth=100,
+    num_recursion=2,
+    heads=128,
+    head_dim=256,
+    qk_rope_head_dim=64,
+    rope_theta=16384.0,
+    yarn_factor=32.0,
+    yarn_original_max=65536,
+    max_seq_len=8_388_608,
+    unit_size=4,
+    kv_groups=5,
+    kv_reindex_per_group=1,
+    isa_compress_ratio=2,
+    indexer_heads=64,
+    indexer_head_dim=128,
+    indexer_topk=2048,
+    attn_softmax_clamp=50.0,
+    gdn2_heads=64,
+    gdn2_d_state=64,
+    gdn2_d_k=64,
+    gdn2_d_v=64,
+    gdn2_d_a=3,
+    hc_mult=4,
+    hc_branch_dim=1024,
+    sinkhorn_iters=20,
+    num_experts=4096,
+    topk=25,
+    moe_latent=4096,
+    moe_inter=4096,
+    engram_layers=(1, 11, 21, 31, 41, 51, 61, 71, 81, 91),
+    engram_orders=(2, 3, 4),
+    engram_heads=8,
+    engram_head_dim=256,
+    engram_rows=33_554_432,
+    image_hidden=1024,
+    image_layers=12,
+    image_heads=16,
+    image_patch=16,
+    image_max_patches=4096,
+    enc_hidden=512,
+    enc_layers=6,
+    enc_heads=8,
+    audio_hidden=768,
+    audio_layers=8,
+    audio_heads=12,
+    audio_conv_kernel=400,
+    audio_conv_stride=160,
+    haptic_conv_kernel=8,
+    haptic_conv_stride=4,
+    max_frames=4096,
+    point3d_points=1024,
+)
+
+# The 40T preview at a reduced loop body (owner-directed 2026-11: base_depth
+# 100 -> 20, keeping loop 2 so logical depth is 40). Engram injection stays at
+# the reference density (one per 10 layers), so only (1, 11) remain in range.
+# Every other field is verbatim _PREVIEW40T_GEOMETRY.
+_PREVIEW40T_GEOMETRY_L20 = _Geometry(
+    hidden_size=16384,
+    vocab_size=524288,
+    base_depth=20,
+    num_recursion=2,
+    heads=128,
+    head_dim=256,
+    qk_rope_head_dim=64,
+    rope_theta=16384.0,
+    yarn_factor=32.0,
+    yarn_original_max=65536,
+    max_seq_len=8_388_608,
+    unit_size=4,
+    kv_groups=5,
+    kv_reindex_per_group=1,
+    isa_compress_ratio=2,
+    indexer_heads=64,
+    indexer_head_dim=128,
+    indexer_topk=2048,
+    attn_softmax_clamp=50.0,
+    gdn2_heads=64,
+    gdn2_d_state=64,
+    gdn2_d_k=64,
+    gdn2_d_v=64,
+    gdn2_d_a=3,
+    hc_mult=4,
+    hc_branch_dim=1024,
+    sinkhorn_iters=20,
+    num_experts=4096,
+    topk=25,
+    moe_latent=4096,
+    moe_inter=4096,
+    engram_layers=(1, 11),
+    engram_orders=(2, 3, 4),
+    engram_heads=8,
+    engram_head_dim=256,
+    engram_rows=33_554_432,
+    image_hidden=1024,
+    image_layers=12,
+    image_heads=16,
+    image_patch=16,
+    image_max_patches=4096,
+    enc_hidden=512,
+    enc_layers=6,
+    enc_heads=8,
+    audio_hidden=768,
+    audio_layers=8,
+    audio_heads=12,
+    audio_conv_kernel=400,
+    audio_conv_stride=160,
+    haptic_conv_kernel=8,
+    haptic_conv_stride=4,
+    max_frames=4096,
+    point3d_points=1024,
+)
+
+# Minimal structural unit of the full geometry: one joint ISA/engram period.# ISA recurs every 4 layers, engram every 6, so the joint period is lcm(4,6)=12
 # (base_depth must stay divisible by unit_size); one replay of the loop.
 # Node counts and per-period work scale linearly in base_depth * num_recursion,
 # so unit timings extrapolate to the full geometry with fixed terms separated.
@@ -437,21 +568,23 @@ def _modality_encoder_config(*, g: _Geometry) -> ModalityEncoder.Config:
             max_frames=g.max_frames,
             stem_conv1=Conv1d.Config(
                 in_channels=1,
-                out_channels=g.enc_hidden,
-                kernel_size=g.conv_kernel,
-                stride=g.conv_stride,
+                out_channels=g.audio_hidden,
+                kernel_size=g.audio_conv_kernel,
+                stride=g.audio_conv_stride,
                 bias=False,
             ),
             stem_conv2=Conv1d.Config(
-                in_channels=g.enc_hidden,
-                out_channels=g.enc_hidden,
+                in_channels=g.audio_hidden,
+                out_channels=g.audio_hidden,
                 kernel_size=3,
                 stride=1,
                 padding=1,
                 bias=False,
             ),
-            blocks=[_encoder_block_config(hidden=g.enc_hidden, heads=g.enc_heads, g=g) for _ in range(g.enc_layers)],
-            norm=_norm(g.enc_hidden, g),
+            blocks=[
+                _encoder_block_config(hidden=g.audio_hidden, heads=g.audio_heads, g=g) for _ in range(g.audio_layers)
+            ],
+            norm=_norm(g.audio_hidden, g),
         ),
         point3d_encoder=PointCloudEncoder.Config(
             mlp_in=_LIN(in_features=3, out_features=g.enc_hidden, bias=False),
@@ -465,8 +598,8 @@ def _modality_encoder_config(*, g: _Geometry) -> ModalityEncoder.Config:
             stem_conv=Conv1d.Config(
                 in_channels=4,
                 out_channels=g.enc_hidden,
-                kernel_size=g.conv_kernel,
-                stride=g.conv_stride,
+                kernel_size=g.haptic_conv_kernel,
+                stride=g.haptic_conv_stride,
                 bias=False,
             ),
             blocks=[_encoder_block_config(hidden=g.enc_hidden, heads=g.enc_heads, g=g) for _ in range(g.enc_layers)],
@@ -476,7 +609,7 @@ def _modality_encoder_config(*, g: _Geometry) -> ModalityEncoder.Config:
             name: _LIN(in_features=hidden, out_features=g.hidden_size, bias=False)
             for name, hidden in (
                 ("image", g.image_hidden),
-                ("audio", g.enc_hidden),
+                ("audio", g.audio_hidden),
                 ("point3d", g.enc_hidden),
                 ("haptic", g.enc_hidden),
             )
@@ -518,6 +651,9 @@ system3_configs = {
     "debugmodel_multimodal": lambda: _make_model_config(multimodal=True, g=_Geometry()),
     "full_text": lambda: _make_model_config(multimodal=False, g=_FULL_GEOMETRY),
     "full_multimodal": lambda: _make_model_config(multimodal=True, g=_FULL_GEOMETRY),
+    "preview40t_text": lambda: _make_model_config(multimodal=False, g=_PREVIEW40T_GEOMETRY),
+    "preview40t_multimodal": lambda: _make_model_config(multimodal=True, g=_PREVIEW40T_GEOMETRY),
+    "preview40t_l20_multimodal": lambda: _make_model_config(multimodal=True, g=_PREVIEW40T_GEOMETRY_L20),
     "unit_text": lambda: _make_model_config(multimodal=False, g=_UNIT_GEOMETRY),
 }
 
@@ -626,6 +762,21 @@ def system3_full_multimodal(*, num_mtp_layers: int = 0, seq_len: int = 2048, ste
     """Full-size multimodal flavor: the published-preview geometry with the
     four modality encoders and interleaved AR sequence assembly."""
     return _system3_trainer_config("full_multimodal", num_mtp_layers=num_mtp_layers, seq_len=seq_len, steps=steps)
+
+
+def system3_preview40t_text(*, num_mtp_layers: int = 0, seq_len: int = 2048, steps: int = 10) -> Trainer.Config:
+    """The published 40T preview text flavor (preset_40T verbatim)."""
+    return _system3_trainer_config("preview40t_text", num_mtp_layers=num_mtp_layers, seq_len=seq_len, steps=steps)
+
+
+def system3_preview40t_multimodal(*, num_mtp_layers: int = 0, seq_len: int = 2048, steps: int = 10) -> Trainer.Config:
+    """The published 40T preview multimodal flavor (preset_40T verbatim)."""
+    return _system3_trainer_config("preview40t_multimodal", num_mtp_layers=num_mtp_layers, seq_len=seq_len, steps=steps)
+
+
+def system3_preview40t_l20_multimodal(*, num_mtp_layers: int = 0, seq_len: int = 2048, steps: int = 10) -> Trainer.Config:
+    """The 40T preview multimodal flavor with the loop body reduced to 20 layers."""
+    return _system3_trainer_config("preview40t_l20_multimodal", num_mtp_layers=num_mtp_layers, seq_len=seq_len, steps=steps)
 
 
 def system3_unit_text(*, num_mtp_layers: int = 0, seq_len: int = 2048, steps: int = 10) -> Trainer.Config:

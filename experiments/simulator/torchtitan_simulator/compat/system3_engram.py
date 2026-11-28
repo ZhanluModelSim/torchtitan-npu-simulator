@@ -30,6 +30,7 @@ import torch
 from torch.distributed._functional_collectives import all_reduce, all_to_all_single
 from torch.profiler import record_function
 
+from torchtitan_simulator.capture.collective_facts import collective_fact_scope
 from torchtitan_simulator.capture.dispatch_capture import (
     annotate_active_capture_events,
     host_only_work,
@@ -400,6 +401,42 @@ def _meta_container_clip_grad_norm(self, parameters, max_norm, **kwargs):
 # ---------------------------------------------------------------------------
 
 
+def _lookup_exchange_facts(mesh, tensor, *, tokens, top_k):
+    """Producer-proven geometry for the Engram lookup exchanges.
+
+    The twin exchanges force-balanced buckets of identical per-rank payload
+    shapes: every rank pushes the same token volume through the same balanced
+    split layout and reads back the same volume. The rows use a symmetric
+    round-robin rotation of the balanced bucket sizes, anchored so the
+    capture-rank row matches the native split lists the exchange passes;
+    every row and every column sums to the same per-rank payload for any
+    token distribution, including non-divisible counts.
+    """
+    from torchtitan_simulator.capture.comm_events import _resolve_comm_ranks
+
+    groups = _resolve_comm_ranks(mesh)
+    if len(groups) != 1:
+        return None
+    size = len(groups[0])
+    local = mesh.get_local_rank()
+    quotient, remainder = divmod(int(tokens) * int(top_k), size)
+    rows = tuple(
+        tuple(
+            quotient + (1 if (rank - local + peer) % size < remainder else 0)
+            for peer in range(size)
+        )
+        for rank in range(size)
+    )
+    shapes = (tuple(int(d) for d in tensor.shape),) * size
+    return {
+        "source": "torchtitan_engram_balanced_lookup_exchange_v1",
+        "send_rows": rows,
+        "recv_rows": tuple(zip(*rows, strict=True)),
+        "rank_input_shapes": shapes,
+        "rank_output_shapes": shapes,
+    }
+
+
 def _balanced_ep_lookup_rows(ctx, weight, row_ids, mesh):
     """Meta decomposition of the routed lookup with balanced split geometry.
 
@@ -420,15 +457,24 @@ def _balanced_ep_lookup_rows(ctx, weight, row_ids, mesh):
     splits = [quotient + int(rank < remainder) for rank in range(ep_size)]
 
     counts = torch.zeros(ep_size, dtype=torch.int64, device=device)
-    all_to_all_single(counts, None, None, mesh)
-    received_ids = all_to_all_single(flat.contiguous(), splits, splits, mesh)
+    with collective_fact_scope(
+        _lookup_exchange_facts(mesh, counts, tokens=1, top_k=ep_size)
+    ):
+        all_to_all_single(counts, None, None, mesh)
+    with collective_fact_scope(
+        _lookup_exchange_facts(mesh, flat, tokens=total, top_k=1)
+    ):
+        received_ids = all_to_all_single(flat.contiguous(), splits, splits, mesh)
     rows_owner_host = torch.empty(
         (received_ids.shape[0], row_dim),
         dtype=weight.dtype,
         device="cpu",
     )
     rows_owner = rows_owner_host.to(device=device)
-    rows = all_to_all_single(rows_owner, splits, splits, mesh)
+    with collective_fact_scope(
+        _lookup_exchange_facts(mesh, rows_owner, tokens=total, top_k=1)
+    ):
+        rows = all_to_all_single(rows_owner, splits, splits, mesh)
 
     # The single logical rank of a capture sends each request to its balanced
     # bucket and reads it back from the same bucket, so the inverse is the
@@ -459,12 +505,15 @@ def _balanced_ep_lookup_grad_rows(ctx, grad_output: torch.Tensor):
         device=grad_output.device,
     )
     grad_unique.index_add_(0, inverse, grad_output.reshape(-1, row_dim).float())
-    received_grads = all_to_all_single(
-        grad_unique.contiguous(),
-        ctx.recv_splits,
-        ctx.send_splits,
-        ctx.mesh,
-    )
+    with collective_fact_scope(
+        _lookup_exchange_facts(ctx.mesh, grad_unique, tokens=grad_unique.shape[0], top_k=1)
+    ):
+        received_grads = all_to_all_single(
+            grad_unique.contiguous(),
+            ctx.recv_splits,
+            ctx.send_splits,
+            ctx.mesh,
+        )
     return received_grads, received_ids
 
 
@@ -571,7 +620,7 @@ def install_system3_engram_meta_support(scope):
     return (
         "host-table lookup keeps the formal autograd boundary with visible transfers (EP=1) / "
         "balanced functional a2a (EP>1); pending sparse gradient, host clip and SparseAdam "
-        "updates record through the system3_sim.sparse_adam_update boundary"
+        "updates record through the fused.sparse_adam_update boundary"
     )
 
 

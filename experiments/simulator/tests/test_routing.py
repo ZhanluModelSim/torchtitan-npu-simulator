@@ -6,6 +6,7 @@
 import pytest
 import torch
 from torchtitan_simulator.compat.routing import balanced_splits
+from torchtitan_simulator.compat.torchao_capture import mx_capture_routes_to_quant_matmul
 
 
 @pytest.mark.parametrize(
@@ -131,6 +132,8 @@ def _reaches(nodes, source, target):
 @pytest.mark.parametrize("mode", ["none", "full", "selective"])
 @pytest.mark.parametrize("quantized", [False, True], ids=["unquantized", "mxfp8"])
 def test_default_single_ep_capture_preserves_gradients_and_causal_dependencies(family, mode, quantized, tmp_path):
+    if quantized and not mx_capture_routes_to_quant_matmul():
+        pytest.skip("torchao-npu build degrades the meta-capture MX matmul to aten.mm")
     from torchtitan_simulator.config import SimulationConfig
     from torchtitan_simulator.runner import simulate
 

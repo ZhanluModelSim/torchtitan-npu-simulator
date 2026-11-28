@@ -55,6 +55,7 @@ def run_simulation_step(
     forward_backward_step: Callable[..., torch.Tensor],
     input_dict: dict[str, torch.Tensor],
     labels: torch.Tensor,
+    extra_loss_inputs: dict[str, torch.Tensor] | None = None,
     optimizer_step: Callable[[], None],
     lr_scheduler_step: Callable[[], None],
     local_batch_size: int,
@@ -78,7 +79,12 @@ def run_simulation_step(
     scoped_backward_phases: bool = False,
 ) -> WorkloadGraph:
     """Capture one non-PP microbatch, or the configured PP schedule, and
-    return the resulting four-layer WorkloadGraph. Bypasses
+    return the resulting four-layer WorkloadGraph. `extra_loss_inputs`
+    declares caller-owned tensors (e.g. offline-distillation teacher
+    outputs) that predate the step: they join `input_dict`/`labels` in the
+    initial-memory registration so the estimator sees their step-start
+    residency instead of inferring an external-input lifecycle at first
+    use. Bypasses
     `Trainer.train_step()` deliberately: that method's `dist_sum`-based
     token counting and loss/grad-norm logging both call `.item()` on
     device tensors, which raises under meta-device execution (see design
@@ -98,6 +104,10 @@ def run_simulation_step(
 
     if gradient_accumulation < 1:
         raise ValueError("gradient_accumulation must be positive")
+    if extra_loss_inputs:
+        for name, tensor in extra_loss_inputs.items():
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(f"extra loss input {name!r} must be a torch.Tensor")
     if parallel_dims.pp_enabled and gradient_accumulation > 1:
         raise ValueError(
             "PP gradient accumulation across multiple schedule steps is not supported by simulator capture"
@@ -229,7 +239,7 @@ def run_simulation_step(
         if initial_states is not None:
             initial_states, _host_initial_states = split_optimizer_state_residency(initial_states)
         capture.record_initial_memory_tensors(
-            (input_dict, labels, global_valid_tokens, initial_states, workspace)
+            (input_dict, labels, global_valid_tokens, initial_states, workspace, extra_loss_inputs or {})
         )
         if enable_memory_tracking:
             optimizer_workspace_tensors = capture.memory_tensor_refs(workspace, name_prefix="optimizer_workspace")

@@ -9,6 +9,7 @@ from collections import Counter
 
 import pytest
 from torchtitan_simulator.cli import main
+from torchtitan_simulator.compat.torchao_capture import mx_capture_routes_to_quant_matmul
 from torchtitan_simulator.validation import validate_workload
 
 
@@ -230,6 +231,8 @@ def test_build_only_and_invalid_simulation_do_not_export_a_memory_result(tmp_pat
 @pytest.mark.parametrize("mode", ["none", "full", "selective"])
 @pytest.mark.parametrize("family", ["deepseek_v4_smoketest", "kimi_k3_smoketest"], ids=["dsv4", "kimi"])
 def test_mxfp8_offload_and_shard_dtype_projection_preserve_native_execution(mode, family):
+    if not mx_capture_routes_to_quant_matmul():
+        pytest.skip("torchao-npu build degrades the meta-capture MX matmul to aten.mm")
     from torchtitan_simulator.config import SimulationConfig
     from torchtitan_simulator.runner import simulate
 

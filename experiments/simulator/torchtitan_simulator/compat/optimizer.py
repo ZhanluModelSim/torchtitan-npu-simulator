@@ -5,6 +5,7 @@
 
 """Permit Meta operands while preserving native optimizer dispatch."""
 
+import torch
 from functools import wraps
 from importlib import import_module
 
@@ -24,3 +25,20 @@ def install_meta_optimizer(scope):
         owner = import_module(module_name)
         if getattr(owner, "_device_dtype_check_for_fused", None) is original_check:
             scope.replace(owner, "_device_dtype_check_for_fused", check)
+
+    # The vendor op-plugin registers its fused AdamW as a composite that
+    # initializes an NPU device even for Meta operands; a device-less (or
+    # driver-only) container then aborts inside ACL with ERR99999.  A pure
+    # Meta void impl keeps the capture dispatch storage-free: the step is
+    # still recorded by the dispatch-capture layer as a single adamw_step
+    # node, which is the only place the optimizer is costed.
+    global _FUSED_ADAMW_META_LIBRARY
+    try:
+        _FUSED_ADAMW_META_LIBRARY = torch.library.Library("aten", "FRAGMENT")
+        _FUSED_ADAMW_META_LIBRARY.impl("_fused_adamw_", lambda *args, **kwargs: None, "Meta")
+    except RuntimeError:
+        # An upstream Meta kernel already exists; keep it.
+        _FUSED_ADAMW_META_LIBRARY = None
+
+
+_FUSED_ADAMW_META_LIBRARY = None

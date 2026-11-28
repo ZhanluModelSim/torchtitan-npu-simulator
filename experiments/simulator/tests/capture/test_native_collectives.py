@@ -6,7 +6,9 @@
 """Native collective identities and independent two-rank transport oracles."""
 
 import multiprocessing
+import sys
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 import torch
@@ -84,8 +86,15 @@ def _gloo_exchange(rank, store_path, queue):
 
 
 def test_native_all_to_all_gloo_preserves_uneven_rows_and_remote_gradients(tmp_path):
-    # Fork keeps this pytest importlib module available to the CPU workers.
-    context = multiprocessing.get_context("fork")
+    # Spawn (not fork): earlier tests leave autograd engine threads behind,
+    # and backward inside a forked worker then hangs instead of erroring, so
+    # the result queue times out. A spawned worker owns a fresh interpreter;
+    # its module re-import reuses the parent's ``sys.path``, so the tests/
+    # package root rides along for ``capture.test_native_collectives``.
+    context = multiprocessing.get_context("spawn")
+    tests_dir = str(Path(__file__).resolve().parents[1])
+    if tests_dir not in sys.path:
+        sys.path.insert(0, tests_dir)
     queue = context.Queue()
     workers = [context.Process(target=_gloo_exchange, args=(rank, str(tmp_path / "group"), queue)) for rank in range(2)]
     try:

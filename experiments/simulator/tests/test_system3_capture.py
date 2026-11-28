@@ -103,9 +103,9 @@ def test_system3_text_capture_reaches_iteration_with_reference_operators():
     assert counts["aten.empty.memory_format"] == 6
     assert len(_table_host_transfers(nodes)) == 6
     # No foreign virtual fusions: the only virtual ops are this workspace's
-    # system3_sim family, and they are the only nodes carrying
+    # fused family, and they are the only nodes carrying
     # ``tensor_semantics`` schema attributes.
-    assert not any(raw.startswith(("multi_head_moe_sim.", "deepseek_v4.")) for raw in counts)
+    assert not any(raw.startswith("deepseek_v4.") for raw in counts)
     semantic_nodes = [n for n in nodes if "tensor_semantics" in n.attrs]
     assert {n.annotations["raw_op_type"] for n in semantic_nodes} == {
         "system3_sim.gdn2_chunked.default",
