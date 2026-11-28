@@ -36,9 +36,9 @@ python -m torchtitan_simulator --config kimi_k3_1_smoketest --training.seq-len 1
 
 Meta runtime 自动安装 K3.1 的三个融合捕获边界：
 
-- `fused.dsa_indexer.default`：输入投影后的 Q、归一化 K 和已缩放的 FP32 weights，输出 int64 选取索引。索引器冻结，没有反向节点。
-- `fused.dsa_attention.default`：输入展开的 Q/K/V 和索引，输出 attention 结果和 FP32 logsumexp。Q/K 为 192 维、V 为 128 维时，输出仍为 128 维。
-- `fused.dsa_attention_grad.default`：读取前向实际保存的 Q/K/V、索引、输出、logsumexp 以及输出梯度，产生 Q/K/V 三项梯度。
+- `kimi_sim.dsa_indexer.default`：输入投影后的 Q、归一化 K 和已缩放的 FP32 weights，输出 int64 选取索引。索引器冻结，没有反向节点。
+- `kimi_sim.dsa_attention.default`：输入展开的 Q/K/V 和索引，输出 attention 结果和 FP32 logsumexp。Q/K 为 192 维、V 为 128 维时，输出仍为 128 维。
+- `kimi_sim.dsa_attention_grad.default`：读取前向实际保存的 Q/K/V、索引、输出、logsumexp 以及输出梯度，产生 Q/K/V 三项梯度。
 
 投影、LayerNorm、weights 缩放和输出门控继续保留在融合边界外。三个节点都有明确的 `tensor_semantics`；不向原始节点填入 FLOPs 或耗时。算子仓为这些训练入口解析逻辑语义，复用现有索引器和 FlashAttention 正反向公式；它们不是吸收投影后的推理 DSA 的原始名别名。
 

@@ -13,8 +13,8 @@
 
 | 组件 | 生产绑定 | simulator 处理 |
 | --- | --- | --- |
-| GDN 核心 | `torchtitan_npu.ops.triton.gdn`（Triton-Ascend，Meta 不可执行） | `fused.gated_delta_rule(_grad)` 虚拟融合，1 前向 + 1 反向算子；头扩展等 eager 算子保留在图中 |
-| FlexAttention 核心 | NPU compile 路径的 flex lowering | `fused.flex_attention(_grad)` 虚拟融合；原生路径在 Meta 上执行 mask_mod 会读到未初始化 Meta 数据（`aten.index` 越界），不能按原生 dispatch 捕获 |
+| GDN 核心 | `torchtitan_npu.ops.triton.gdn`（Triton-Ascend，Meta 不可执行） | `qwen3_5_sim.gated_delta_rule(_grad)` 虚拟融合，1 前向 + 1 反向算子；头扩展等 eager 算子保留在图中 |
+| FlexAttention 核心 | NPU compile 路径的 flex lowering | `qwen3_5_sim.flex_attention(_grad)` 虚拟融合；原生路径在 Meta 上执行 mask_mod 会读到未初始化 Meta 数据（`aten.index` 越界），不能按原生 dispatch 捕获 |
 | causal conv | override 的纯 torch 实现（F.pad/conv1d/silu） | 原生 dispatch，无桥接 |
 | MoE dispatcher | `token_dispatcher.asc`（npu permute/unpermute） | 与 DSV4/Kimi 共用 `_COMMON_OVERRIDES` 与 permute 兼容层；语义声明复用主包包装算子表 |
 | vision tower | VL 训练参与，text-only 配方 detach | preset 的 `_parallelize_text_capture` 按 `qwen35_27b_long_text_sft` 同款方式置 None；文本捕获图不含 vision 算子 |
