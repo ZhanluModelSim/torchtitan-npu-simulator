@@ -62,9 +62,6 @@ class SimulationConfig:
             raise ValueError("optimizer_name must be AdamW or Muon")
         if self.muon_ns_steps is not None and (type(self.muon_ns_steps) is not int or self.muon_ns_steps < 1):
             raise ValueError("muon_ns_steps must be a positive integer")
-        # muon_ns_steps applicability is validated in _prepare_optimizer against
-        # the final optimizer selection (optimizer_name or a native Muon recipe);
-        # an early reject here would also reject legal Muon configurations.
         if type(self.memory_offload_optimizer_states) is not bool:
             raise ValueError("memory_offload_optimizer_states must be boolean")
         if type(self.enable_sla2_fusion) is not bool:
@@ -274,6 +271,10 @@ PRESET_FACTORIES = {
     "multi_head_moe_debugmodel_head_parallel": "torchtitan_simulator.presets.multi_head_moe_debugmodel_head_parallel",
     "multi_head_moe_2p5t": "torchtitan_simulator.presets.multi_head_moe_2p5t",
     "multi_head_moe_2p5t_head_parallel": "torchtitan_simulator.presets.multi_head_moe_2p5t_head_parallel",
+    "sys2mot_debugmodel_multimodal": "torchtitan_npu.models.sys2mot.config_registry.sys2mot_debugmodel_multimodal",
+    "sys2mot_mid_multimodal": "torchtitan_npu.models.sys2mot.config_registry.sys2mot_mid_multimodal",
+    "sys2mot_student30b_multimodal": "torchtitan_npu.models.sys2mot.config_registry.sys2mot_student30b_multimodal",
+    "sys2mot_student300b_multimodal": "torchtitan_npu.models.sys2mot.config_registry.sys2mot_student300b_multimodal",
 }
 
 
@@ -315,10 +316,11 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         "qwen3_5",
         "multi_head_moe",
         "system3",
+        "sys2mot",
     }:
         raise ValueError(
             "Supported model families are deepseek_v4, deepseek_v4_1, kimi_k3, "
-            "kimi_k3_1, qwen3, qwen3_5, multi_head_moe and system3"
+            "kimi_k3_1, qwen3, qwen3_5, multi_head_moe, system3 and sys2mot"
         )
     adaptations = []
     if simulation.model_overrides is not None:
@@ -368,6 +370,12 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
                 "qwen3": _QWEN3_OVERRIDES,
                 "qwen3_5": _QWEN3_5_OVERRIDES,
                 "system3": _SYSTEM3_OVERRIDES,
+                # sys2mot reproduces the reference's own RMSNorm math (the
+                # compat module bridges its own classes), so the shared
+                # RMSNorm/rotary config overrides find no target in its tree;
+                # its dispatcher config is the shared AllToAll one, so the
+                # fused npu_moe_token_permute/unpermute boundary applies.
+                "sys2mot": ["torchtitan_npu.override.common.token_dispatcher.asc"],
             }[trainer.model_spec.name]
         )
         if simulation.override_imports is None
