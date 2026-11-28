@@ -95,6 +95,7 @@ def csa_indexer_backward(
     index_key: torch.Tensor,
     weights: torch.Tensor,
     key_valid: torch.Tensor,
+    compression_ratio: int,
     prev_candidates: Optional[torch.Tensor],
     upstream: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -104,7 +105,11 @@ def csa_indexer_backward(
 
 
 @csa_indexer_backward.register_fake
-def _csa_indexer_backward_meta(query, index_key, weights, key_valid, prev_candidates, upstream):
+def _csa_indexer_backward_meta(
+    query, index_key, weights, key_valid, compression_ratio, prev_candidates, upstream
+):
+    if compression_ratio <= 0:
+        raise ValueError("csa indexer backward compression ratio must be positive")
     batch, queries, heads, dim = query.shape
     keys = index_key.shape[1]
     if upstream.shape != (batch, queries, keys) or upstream.dtype != torch.float32:
@@ -120,12 +125,19 @@ def _csa_indexer_backward_meta(query, index_key, weights, key_valid, prev_candid
 
 def _csa_setup(ctx, inputs, output):
     ctx.save_for_backward(inputs[0], inputs[1], inputs[2], inputs[3], inputs[4])
+    ctx.compression_ratio = inputs[5]
 
 
 def _csa_backward(ctx, grad_indices, grad_scores, grad_allowed, grad_candidates):
     query, index_key, weights, key_valid, prev_candidates = ctx.saved_tensors
     query_grad, key_grad, weight_grad = csa_indexer_backward(
-        query, index_key, weights, key_valid, prev_candidates, grad_scores
+        query,
+        index_key,
+        weights,
+        key_valid,
+        ctx.compression_ratio,
+        prev_candidates,
+        grad_scores,
     )
     return (query_grad, key_grad, weight_grad, None, None, None, None, None, None, None)
 
